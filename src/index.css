@@ -1,0 +1,209 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 40 33% 96%;
+    --foreground: 222 47% 11%;
+
+    --card: 0 0% 100%;
+    --card-foreground: 222 47% 11%;
+
+    --popover: 0 0% 100%;
+    --popover-foreground: 222 47% 11%;
+
+    --primary: 222 70% 33%;
+    --primary-foreground: 0 0% 100%;
+
+    --secondary: 40 30% 92%;
+    --secondary-foreground: 222 47% 11%;
+
+    --muted: 40 20% 90%;
+    --muted-foreground: 222 20% 45%;
+
+    --accent: 174 85% 32%;
+    --accent-foreground: 0 0% 100%;
+
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 0 0% 100%;
+
+    --border: 40 15% 85%;
+    --input: 40 15% 85%;
+    --ring: 222 70% 33%;
+
+    --radius: 0.75rem;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  html {
+    scroll-behavior: smooth;
+  }
+
+  body {
+    @apply bg-black text-foreground antialiased;
+    font-family: 'DM Sans', system-ui, sans-serif;
+    overflow-x: hidden;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4,
+  h5,
+  h6 {
+    font-family: 'Playfair Display', serif;
+  }
+}
+
+@layer components {
+
+  /* Language card — light theme with colored top border */
+  .language-card {
+    @apply relative overflow-hidden rounded-xl bg-white border border-gray-200;
+    @apply transition-all duration-300 ease-out cursor-pointer;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
+  }
+
+  .language-card:hover {
+    transform: translateY(-4px);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.1);
+  }
+
+  .language-card:active {
+    transform: translateY(-2px);
+  }
+
+  /* Colored top border on cards */
+  .language-card::before {
+    content: '';
+    @apply absolute top-0 left-0 right-0;
+    height: 4px;
+    background: var(--card-accent, #1e3a8a);
+  }
+
+  /* Back button — light theme */
+  .back-button {
+    @apply flex items-center gap-2 px-4 py-2 rounded-full;
+    @apply text-indigo bg-white border border-gray-200;
+    @apply transition-all duration-200;
+    @apply hover:bg-gray-50 hover:shadow-sm;
+    font-family: 'DM Sans', sans-serif;
+  }
+
+  /* Mic button — light theme */
+  .mic-button {
+    @apply relative rounded-full;
+    background: linear-gradient(135deg, #1e3a8a 0%, #2d4ea1 100%);
+    box-shadow: 0 8px 32px rgba(30, 58, 138, 0.25),
+      0 4px 16px rgba(0, 0, 0, 0.1);
+  }
+
+  .mic-button.listening {
+    background: linear-gradient(135deg, #0d9488 0%, #14b8a6 100%);
+    box-shadow: 0 8px 32px rgba(13, 148, 136, 0.3),
+      0 4px 16px rgba(0, 0, 0, 0.1);
+  }
+}
+
+/* Waveform bar animation for result page */
+@keyframes waveBar {
+  0% {
+    transform: scaleY(0.4);
+  }
+
+  100% {
+    transform: scaleY(1.4);
+  }
+}
+
+/* Speaker animation bars for voice player */
+.voice-bar {
+  width: 3px;
+  height: 14px;
+  background-color: #f59e0b;
+  border-radius: 2px;
+  animation: voiceBarPulse 0.5s ease-in-out infinite alternate;
+}
+
+@keyframes voiceBarPulse {
+  0% {
+    height: 4px;
+    opacity: 0.4;
+  }
+
+  100% {
+    height: 14px;
+    opacity: 1;
+  }
+}
+
+/* ── Intro Screen ── */
+.intro-screen {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #000000;
+  transition: opacity 500ms ease-in-out;
+}
+
+.intro-content {
+  position: relative;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2.5rem;
+}
+
+.intro-title {
+  font-family: 'Playfair Display', serif;
+  font-size: clamp(2rem, 5vw, 3.5rem);
+  font-weight: 700;
+  color: #f5f5f5;
+  text-align: center;
+  letter-spacing: -0.01em;
+}
+
+.intro-title-accent {
+  color: #f59e0b;
+}
+
+.intro-language-container {
+  height: 5rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.intro-language {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.35rem;
+  transition: opacity 200ms ease-in-out, transform 200ms ease-in-out;
+}
+
+.intro-language-native {
+  font-family: 'DM Sans', 'Noto Sans Devanagari', 'Noto Sans Bengali',
+    'Noto Sans Tamil', 'Noto Sans Telugu', 'Noto Sans Kannada',
+    'Noto Sans Malayalam', 'Noto Sans Gurmukhi', 'Noto Sans Gujarati',
+    sans-serif;
+  font-size: clamp(1.75rem, 4vw, 2.75rem);
+  font-weight: 700;
+  color: #f59e0b;
+}
+
+.intro-language-english {
+  font-family: 'DM Sans', sans-serif;
+  font-size: 0.75rem;
+  font-weight: 500;
+  letter-spacing: 0.2em;
+  color: rgba(245, 245, 245, 0.5);
+}
