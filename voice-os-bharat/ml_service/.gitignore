@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+venv/
+.venv/
+
+# Environment
+.env
+
+# Audio output (generated files)
+audio_output/*
+!audio_output/.gitkeep
+
+# Model weights (too large for git)
+models/saved_model/model.safetensors
+models/saved_model/pytorch_model.bin
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
