@@ -1,0 +1,10 @@
+node_modules/
+**pycache**/
+.env
+models/
+*.wav
+*.mp3
+dist/
+*.log
+voice-os-bharat/
+.vscode/
