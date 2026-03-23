@@ -1,4 +1,4 @@
-import { useEffect, useCallback } from 'react';
+import { useCallback } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { Mic, RotateCcw } from 'lucide-react';
 

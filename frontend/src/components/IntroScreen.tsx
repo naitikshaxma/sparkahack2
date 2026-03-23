@@ -4,14 +4,6 @@ import SparkleBackground from './result/SparkleBackground';
 const languages = [
     { native: 'हिन्दी', english: 'HINDI' },
     { native: 'English', english: 'ENGLISH' },
-    { native: 'मराठी', english: 'MARATHI' },
-    { native: 'বাংলা', english: 'BENGALI' },
-    { native: 'தமிழ்', english: 'TAMIL' },
-    { native: 'తెలుగు', english: 'TELUGU' },
-    { native: 'ಕನ್ನಡ', english: 'KANNADA' },
-    { native: 'മലയാളം', english: 'MALAYALAM' },
-    { native: 'ਪੰਜਾਬੀ', english: 'PUNJABI' },
-    { native: 'ગુજરાતી', english: 'GUJARATI' },
 ];
 
 const INTERVAL_MS = 450;
@@ -79,7 +71,7 @@ const IntroScreen = ({ onComplete }: IntroScreenProps) => {
 
                 {/* Subtitle */}
                 <p className="intro-subtitle">
-                    Multilingual Voice Assistant for Bharat
+                    Bilingual Voice Assistant for Bharat
                 </p>
             </div>
         </div>

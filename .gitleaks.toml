@@ -1,0 +1,9 @@
+title = "Voice OS Bharat gitleaks config"
+
+[allowlist]
+description = "Allowlisted sample files with placeholder values"
+paths = [
+  '''\.env\.example$''',
+  '''frontend/\.env\.example$''',
+  '''docs/SECRET_HISTORY_CLEANUP\.md$'''
+]

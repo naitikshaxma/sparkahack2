@@ -48,6 +48,17 @@ Copy-Item .env.example .env
 ```
 Update `.env` if you need custom runtime values.
 
+Security notes:
+- Backend startup validates critical env values and fails fast if required secrets are missing or placeholders.
+- Never commit real credentials in `.env`; keep only placeholders in `.env.example`.
+- Install repository hooks to block secret commits:
+
+```powershell
+./scripts/install_git_hooks.ps1
+```
+
+If a secret is exposed, follow [docs/SECRET_HISTORY_CLEANUP.md](docs/SECRET_HISTORY_CLEANUP.md).
+
 ## API Endpoints
 
 - `GET /health`
@@ -72,3 +83,36 @@ Update `.env` if you need custom runtime values.
 - `POST /api/process-audio`
   - Multipart form: `audio` or `text`, `user_id`, optional `language`
   - Returns full assistant response (transcript + intent + text + audio).
+
+## Frontend Launch Features
+
+- Real-time streamed response rendering with audio/text sync
+- Voice lifecycle UX: listening, processing, speaking, interrupted
+- Barge-in support and instant interruption handling
+- Failsafe text input when microphone flow is unavailable
+- Development-only debug panel for voice state, latency, detected language, and request id
+- Conversation history timeline persisted per active session id
+- Demo mode toggle with guided preloaded prompts
+
+## Deployment Configuration
+
+- Frontend runtime endpoints are configured through environment variables:
+  - `VITE_API_BASE_URL`
+  - `VITE_BACKEND_URL` (backward-compatible alias)
+- Production template: [frontend/.env.production](frontend/.env.production)
+
+## Documentation Index
+
+- API reference: [docs/API_OVERVIEW.md](docs/API_OVERVIEW.md)
+- Architecture summary: [docs/ARCHITECTURE_SUMMARY.md](docs/ARCHITECTURE_SUMMARY.md)
+- Secret recovery runbook: [docs/SECRET_HISTORY_CLEANUP.md](docs/SECRET_HISTORY_CLEANUP.md)
+- Release checklist: [docs/RELEASE_CHECKLIST_v1.0.md](docs/RELEASE_CHECKLIST_v1.0.md)
+
+## Release Preparation (v1.0)
+
+Suggested release commands:
+
+```powershell
+git tag v1.0
+git push origin v1.0
+```

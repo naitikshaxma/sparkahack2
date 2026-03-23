@@ -15,27 +15,11 @@ interface LanguageSelectorProps {
 const cardAccents: Record<string, string> = {
   hi: '#f59e0b',
   en: '#9ca3af',
-  mr: '#ea580c',
-  bn: '#dc2626',
-  ta: '#14b8a6',
-  te: '#b91c1c',
-  kn: '#16a34a',
-  ml: '#7c3aed',
-  pa: '#d97706',
-  gu: '#2563eb',
 };
 
 const languages: Language[] = [
   { code: 'hi', name: 'Hindi', nativeName: 'हिन्दी', greeting: 'नमस्ते, मैं आपकी कैसे मदद कर सकता हूँ?' },
   { code: 'en', name: 'English', nativeName: 'English', greeting: 'Hello, how can I help you?' },
-  { code: 'mr', name: 'Marathi', nativeName: 'मराठी', greeting: 'नमस्कार, मी तुम्हाला कशी मदत करू?' },
-  { code: 'bn', name: 'Bengali', nativeName: 'বাংলা', greeting: 'নমস্কার, আমি আপনাকে কীভাবে সাহায্য করতে পারি?' },
-  { code: 'ta', name: 'Tamil', nativeName: 'தமிழ்', greeting: 'வணக்கம், நான் உங்களுக்கு எப்படி உதவலாம்?' },
-  { code: 'te', name: 'Telugu', nativeName: 'తెలుగు', greeting: 'నమస్కారం, నేను మీకు ఎలా సహాయం చేయగలను?' },
-  { code: 'kn', name: 'Kannada', nativeName: 'ಕನ್ನಡ', greeting: 'ನಮಸ್ಕಾರ, ನಾನು ನಿಮಗೆ ಹೇಗೆ ಸಹಾಯ ಮಾಡಬಹುದು?' },
-  { code: 'ml', name: 'Malayalam', nativeName: 'മലയാളം', greeting: 'നമസ്കാരം, ഞാൻ നിങ്ങളെ എങ്ങനെ സഹായിക്കാം?' },
-  { code: 'pa', name: 'Punjabi', nativeName: 'ਪੰਜਾਬੀ', greeting: 'ਸਤ ਸ੍ਰੀ ਅਕਾਲ, ਮੈਂ ਤੁਹਾਡੀ ਕਿਵੇਂ ਮਦਦ ਕਰ ਸਕਦਾ ਹਾਂ?' },
-  { code: 'gu', name: 'Gujarati', nativeName: 'ગુજરાતી', greeting: 'નમસ્તે, હું તમને કેવી રીતે મદદ કરી શકું?' },
 ];
 
 const LanguageSelector = ({ onSelectLanguage }: LanguageSelectorProps) => {
@@ -43,6 +27,7 @@ const LanguageSelector = ({ onSelectLanguage }: LanguageSelectorProps) => {
 
   const handleClick = useCallback(
     (lang: Language) => {
+      localStorage.setItem("language", lang.code);
       onSelectLanguage(lang);
     },
     [onSelectLanguage]
@@ -61,7 +46,7 @@ const LanguageSelector = ({ onSelectLanguage }: LanguageSelectorProps) => {
       </div>
 
       {/* Language card grid */}
-      <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-4">
+      <div className="grid grid-cols-2 gap-4 max-w-md mx-auto">
         {languages.map((lang, index) => {
           const accent = cardAccents[lang.code] || '#9ca3af';
           const isHovered = hoveredLang === lang.code;

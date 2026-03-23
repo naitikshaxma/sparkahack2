@@ -6,41 +6,17 @@
 export const langVoiceTags: Record<string, string[]> = {
   hi: ['hi-IN', 'hi'],
   en: ['en-IN', 'en-US', 'en-GB', 'en'],
-  mr: ['mr-IN', 'mr'],
-  bn: ['bn-IN', 'bn-BD', 'bn'],
-  ta: ['ta-IN', 'ta'],
-  te: ['te-IN', 'te'],
-  kn: ['kn-IN', 'kn'],
-  ml: ['ml-IN', 'ml'],
-  pa: ['pa-IN', 'pa-Guru-IN', 'pa'],
-  gu: ['gu-IN', 'gu'],
 };
 
 export const langSearchNames: Record<string, string[]> = {
   hi: ['hindi', 'हिन्दी', 'swara'],
   en: ['english', 'heera'],
-  mr: ['marathi'],
-  bn: ['bengali', 'bangla'],
-  ta: ['tamil'],
-  te: ['telugu'],
-  kn: ['kannada'],
-  ml: ['malayalam'],
-  pa: ['punjabi', 'panjabi'],
-  gu: ['gujarati'],
 };
 
 /** Bottom-of-page hint text per language on the voice interaction page */
 export const micHints: Record<string, string> = {
   hi: 'माइक बटन दबाएं और बोलें',
   en: 'Tap the microphone and speak',
-  mr: 'मायक्रोफोन दाबा आणि बोला',
-  bn: 'মাইক বাটন চাপুন এবং বলুন',
-  ta: 'மைக்கை தட்டி பேசுங்கள்',
-  te: 'మైక్ నొక్కి మాట్లాడండి',
-  kn: 'ಮೈಕ್ ಒತ್ತಿ ಮಾತಾಡಿ',
-  ml: 'മൈക്ക് അമർത്തി സംസാരിക്കൂ',
-  pa: 'ਮਾਈਕ ਬਟਨ ਦਬਾਓ ਅਤੇ ਬੋਲੋ',
-  gu: 'માઇક બટન દબાવો અને બોલો',
 };
 
 /**

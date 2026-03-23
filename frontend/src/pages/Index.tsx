@@ -19,6 +19,7 @@ const Index = () => {
   const [selectedLanguage, setSelectedLanguage] = useState<Language | null>(null);
 
   const handleLanguageSelect = useCallback((language: Language) => {
+    localStorage.setItem('language', language.code);
     setSelectedLanguage(language);
     setStage('voice');
   }, []);
@@ -30,13 +31,10 @@ const Index = () => {
   /* Voice interaction — full screen with dark bg */
   if (stage === 'voice' && selectedLanguage) {
     return (
-      <>
-        <SparkleBackground />
-        <VoiceInteraction
-          language={selectedLanguage}
-          onBack={handleBackToLanding}
-        />
-      </>
+      <VoiceInteraction
+        language={selectedLanguage}
+        onBack={handleBackToLanding}
+      />
     );
   }
 
@@ -51,7 +49,7 @@ const Index = () => {
         {/* Hero section */}
         <div className="w-full max-w-5xl mx-auto px-4 sm:px-6 pt-10 pb-2 text-center">
           <p className="text-sm font-body font-medium text-[#14b8a6] uppercase tracking-widest mb-3 opacity-0 animate-fade-in">
-            Multilingual Voice Assistant
+            Bilingual Voice Assistant
           </p>
           <h1 className="text-4xl md:text-5xl font-heading font-bold text-[#f5f5f5] leading-tight opacity-0 animate-fade-in" style={{ animationDelay: '0.1s' }}>
             Speak in your language.
@@ -67,6 +65,7 @@ const Index = () => {
         {/* Language selector */}
         <LanguageSelector onSelectLanguage={handleLanguageSelect} />
 
+
         {/* About section */}
         <section className="relative z-10 w-full max-w-4xl mx-auto px-6 py-10">
           <div className="bg-[#111111] rounded-xl border border-[#2a2a2a] p-6 md:p-8">
@@ -74,8 +73,8 @@ const Index = () => {
               About Voice OS
             </h3>
             <p className="text-[#9ca3af] font-body text-sm leading-relaxed">
-              Voice OS Bharat is a multilingual AI voice assistant built for Bharat.
-              It supports 10 Indian languages including Hindi, Tamil, Bengali, Telugu, and more.
+              Voice OS Bharat is a bilingual AI voice assistant built for Bharat.
+              It supports two languages: Hindi and English.
               Simply select your language and start speaking — the assistant will listen,
               understand, and respond in your preferred language.
             </p>

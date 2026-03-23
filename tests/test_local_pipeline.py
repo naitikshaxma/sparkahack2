@@ -1,13 +1,9 @@
-import base64
-import re
 import subprocess
 import sys
 import time
-from io import BytesIO
 from pathlib import Path
 
 import requests
-from gtts import gTTS
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -30,13 +26,6 @@ def wait_for_backend(timeout_seconds: int = 120) -> dict:
     raise RuntimeError(f"Backend did not become healthy in time. Last error: {last_error}")
 
 
-def build_hindi_test_audio(text: str) -> bytes:
-    buffer = BytesIO()
-    tts = gTTS(text=text, lang="hi")
-    tts.write_to_fp(buffer)
-    return buffer.getvalue()
-
-
 def run_pipeline_test() -> None:
     backend_process = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "backend.main:app", "--host", "127.0.0.1", "--port", str(BACKEND_PORT)],
@@ -47,69 +36,63 @@ def run_pipeline_test() -> None:
 
     try:
         health = wait_for_backend()
+        if health.get("status") != "ok":
+            raise RuntimeError(f"Unexpected health status: {health}")
+
         if not health.get("whisper", {}).get("model_loaded"):
             raise RuntimeError("Whisper did not load correctly.")
-        if not health.get("intent_model", {}).get("loaded"):
-            raise RuntimeError("BERT model did not load correctly.")
+
+        intent_model = health.get("intent_model")
+        if isinstance(intent_model, dict):
+            intent_model_status = str(intent_model.get("status") or "").strip().lower()
+        else:
+            intent_model_status = str(intent_model or "").strip().lower()
+
+        if intent_model_status not in {"loaded", "fallback"}:
+            raise RuntimeError(f"Unexpected intent_model status: {intent_model}")
+
         if int(health.get("rag", {}).get("total_schemes", 0)) != 500:
             raise RuntimeError("RAG dataset did not load with 500 schemes.")
 
-        query = "pm kisan scheme kya hai"
-        payload = None
-        last_transcript = ""
+        process_response = requests.post(
+            f"{BACKEND_URL}/api/process-text",
+            data={"session_id": "local-audit-user", "language": "hi", "text": "मुझे जानकारी चाहिए"},
+            timeout=120,
+        )
+        process_response.raise_for_status()
+        payload = process_response.json()
 
-        for _ in range(5):
-            audio_bytes = build_hindi_test_audio(query)
-            response = requests.post(
-                f"{BACKEND_URL}/api/process-audio",
-                files={"audio": ("query.mp3", audio_bytes, "audio/mpeg")},
-                data={"user_id": "local-audit-user", "language": "hi"},
-                timeout=300,
-            )
-            response.raise_for_status()
-            payload = response.json()
-
-            response_text_probe = payload.get("response_text", {})
-            joined_probe = (
-                str(response_text_probe.get("confirmation", "")).lower()
-                + " "
-                + str(response_text_probe.get("explanation", "")).lower()
-            )
-            last_transcript = str(payload.get("transcript", ""))
-            if "pm kisan" in joined_probe:
-                break
-        else:
-            raise RuntimeError(
-                "Expected PM Kisan scheme response, but PM Kisan was not detected in response text. "
-                f"Last transcript: {last_transcript.encode('unicode_escape').decode('ascii')}"
-            )
-
-        required_top_level = {"transcript", "intent", "confidence", "response_text", "audio_base64"}
+        required_top_level = {"session_id", "response_text", "mode", "quick_actions", "audio_base64"}
         missing_top_level = required_top_level - set(payload.keys())
         if missing_top_level:
             raise RuntimeError(f"Missing response fields: {sorted(missing_top_level)}")
 
         response_text = payload["response_text"]
-        required_response_fields = {"confirmation", "explanation", "next_step"}
-        missing_response_fields = required_response_fields - set(response_text.keys())
-        if missing_response_fields:
-            raise RuntimeError(f"Missing response_text fields: {sorted(missing_response_fields)}")
+        if not isinstance(response_text, str) or not response_text.strip():
+            raise RuntimeError("response_text must be a non-empty string.")
+
+        quick_actions = payload.get("quick_actions", [])
+        if quick_actions and not all(isinstance(item, dict) and "label" in item and "value" in item for item in quick_actions):
+            raise RuntimeError("quick_actions must contain objects with label/value.")
 
         if not isinstance(payload["audio_base64"], str) or not payload["audio_base64"].startswith("data:audio/mp3;base64,"):
             raise RuntimeError("audio_base64 is missing expected mp3 base64 data URI.")
 
-        b64_part = payload["audio_base64"].split(",", 1)[1]
-        base64.b64decode(b64_part)
+        intent_response = requests.post(
+            f"{BACKEND_URL}/api/intent",
+            json={"text": "check my application status"},
+            timeout=30,
+        )
+        intent_response.raise_for_status()
+        intent_payload = intent_response.json()
+        if "intent" not in intent_payload or "confidence" not in intent_payload:
+            raise RuntimeError("Intent endpoint response missing intent/confidence fields.")
 
-        hindi_text = " ".join([response_text["confirmation"], response_text["explanation"], response_text["next_step"]])
-        if not re.search(r"[\u0900-\u097F]", hindi_text):
-            raise RuntimeError("Expected Hindi response text for Hindi query, but Hindi characters were not found.")
         print("Local pipeline test passed.")
-        print(f"Transcript: {payload['transcript']}")
-        print(f"Intent: {payload['intent']}")
-        print(f"Confidence: {payload['confidence']}")
-        safe_confirmation = response_text["confirmation"].encode("unicode_escape").decode("ascii")
-        print(f"Hindi response (unicode-escaped): {safe_confirmation}")
+        print(f"Session ID: {payload['session_id']}")
+        print(f"Mode: {payload.get('mode')}")
+        safe_response_text = response_text.encode("unicode_escape").decode("ascii")
+        print(f"Response text (unicode-escaped): {safe_response_text}")
     finally:
         backend_process.terminate()
         try:

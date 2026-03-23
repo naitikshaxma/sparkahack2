@@ -1,4 +1,5 @@
 import json
+import logging
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -7,6 +8,7 @@ from rapidfuzz import fuzz
 from .text_normalizer import normalize_text
 
 DATA_PATH = Path(__file__).resolve().parent.parent / "datasets" / "schemes_dataset.json"
+logger = logging.getLogger(__name__)
 REQUIRED_FIELDS = {
     "name",
     "keywords",
@@ -89,11 +91,6 @@ SCHEMES = _load_schemes()
 PREPARED_SCHEMES: List[Tuple[dict, List[str]]] = [(scheme, _build_terms(scheme)) for scheme in SCHEMES]
 
 
-def _debug_print(label: str, value: str) -> None:
-    safe_value = str(value).encode("unicode_escape").decode("ascii")
-    print(label, safe_value)
-
-
 def _filter_generic_tokens(text: str) -> str:
     tokens = [token for token in text.split() if token not in GENERIC_KEYWORDS]
     return " ".join(tokens).strip()
@@ -109,7 +106,7 @@ def get_rag_status() -> dict:
 
 def retrieve_scheme(transcript: str, language: str = "en") -> Optional[dict]:
     query = normalize_text(transcript)
-    _debug_print("Query:", query)
+    logger.debug("RAG retrieval query normalized")
     if not query:
         return None
 
@@ -134,8 +131,7 @@ def retrieve_scheme(transcript: str, language: str = "en") -> Optional[dict]:
             if len(keyword_tokens) > 1 and len(overlap) == 1 and score < 85:
                 continue
             if score > 75:
-                _debug_print("Matched keyword:", keyword)
-                print("Match score:", score)
+                logger.debug("RAG keyword matched")
                 if lang == "hi":
                     return {
                         "confirmation": scheme["summary_hi"],
@@ -148,3 +144,33 @@ def retrieve_scheme(transcript: str, language: str = "en") -> Optional[dict]:
                     "next_step": "Would you like to know eligibility or how to apply?",
                 }
     return None
+
+
+def recommend_schemes(transcript: str, language: str = "en", limit: int = 3) -> List[str]:
+    query = normalize_text(transcript)
+    if not query:
+        return [str(scheme.get("name", "")).strip() for scheme in SCHEMES[:limit] if scheme.get("name")]
+
+    query_lower = query.lower()
+    query_filtered = _filter_generic_tokens(query_lower)
+    query_for_match = query_filtered or query_lower
+
+    scored: List[Tuple[int, str]] = []
+    for scheme, terms in PREPARED_SCHEMES:
+        name = str(scheme.get("name", "")).strip()
+        if not name:
+            continue
+
+        best = 0
+        for term in terms:
+            score = int(fuzz.partial_ratio(term.lower(), query_for_match.lower()))
+            if score > best:
+                best = score
+
+        scored.append((best, name))
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+    recommended = [name for _, name in scored[:limit]]
+    if not recommended:
+        return [str(scheme.get("name", "")).strip() for scheme in SCHEMES[:limit] if scheme.get("name")]
+    return recommended

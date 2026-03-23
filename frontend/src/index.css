@@ -1,3 +1,5 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
@@ -45,8 +47,9 @@
 
   body {
     @apply bg-black text-foreground antialiased;
-    font-family: 'DM Sans', system-ui, sans-serif;
+    font-family: 'Inter', system-ui, sans-serif;
     overflow-x: hidden;
+    line-height: 1.5;
   }
 
   h1,
@@ -191,10 +194,7 @@
 }
 
 .intro-language-native {
-  font-family: 'DM Sans', 'Noto Sans Devanagari', 'Noto Sans Bengali',
-    'Noto Sans Tamil', 'Noto Sans Telugu', 'Noto Sans Kannada',
-    'Noto Sans Malayalam', 'Noto Sans Gurmukhi', 'Noto Sans Gujarati',
-    sans-serif;
+  font-family: 'DM Sans', 'Noto Sans Devanagari', sans-serif;
   font-size: clamp(1.75rem, 4vw, 2.75rem);
   font-weight: 700;
   color: #f59e0b;
@@ -216,4 +216,15 @@
   color: rgba(245, 245, 245, 0.45);
   text-align: center;
   margin-top: -0.75rem;
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }

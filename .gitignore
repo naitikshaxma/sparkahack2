@@ -1,6 +1,9 @@
 node_modules/
 **pycache**/
 .env
+.env.*
+!.env.example
+.venv/
 models/
 *.wav
 *.mp3
@@ -8,3 +11,5 @@ dist/
 *.log
 voice-os-bharat/
 .vscode/
+.gitleaks-report.json
+backend/intent_metrics.json
