@@ -28,12 +28,21 @@ def test_config_validation_rejects_placeholder_openai_key() -> None:
         max_text_input_chars=500,
         max_session_id_chars=64,
         api_rate_limit_window_seconds=60,
-        api_rate_limit_max_requests=80,
+        api_rate_limit_max_requests=100,
         api_key_rate_limit_max_requests=120,
         max_request_size_bytes=1048576,
         trust_proxy_headers=False,
         enable_api_key_auth=False,
         api_auth_key="",
+        database_url="postgresql://localhost:5432/testdb",
+        jwt_secret_key="dev-jwt-secret-change-me",
+        jwt_algorithm="HS256",
+        jwt_expiration_minutes=60,
+        jwt_required_for_protected_routes=False,
+        jwt_protected_prefixes=("/api/private", "/api/v1/private"),
+        frontend_dev_origin="http://127.0.0.1:5173",
+        frontend_production_origin="https://voice-os-bharat.com",
+        cors_allow_origins=("http://127.0.0.1:5173", "https://voice-os-bharat.com"),
     )
 
     with pytest.raises(RuntimeError):

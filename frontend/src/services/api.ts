@@ -5,7 +5,8 @@ type MetaEnv = {
 };
 
 const meta = import.meta as ImportMeta & { env?: MetaEnv };
-const env = meta.env ?? {};
+const fallbackEnv = (globalThis as { __APP_ENV__?: MetaEnv }).__APP_ENV__ ?? {};
+const env = meta.env ?? fallbackEnv;
 
 const ENV_BACKEND_URL = env.VITE_API_BASE_URL || env.VITE_BACKEND_URL || "";
 const API_BASE_URL = env.DEV ? "" : ENV_BACKEND_URL;
@@ -30,6 +31,7 @@ export interface BackendResponse {
   validation_passed: boolean;
   validation_error: string | null;
   session_complete: boolean;
+  tts_error?: string | null;
   mode?: "info" | "action" | "clarify";
   action?: string | null;
   steps_done?: number;
@@ -79,6 +81,17 @@ export type ProcessTextStreamEvent =
   | { type: "audio_chunk"; seq: number; text_segment: string; audio_base64: string }
   | { type: "interrupted"; session_id: string }
   | { type: "done"; session_id: string };
+
+export interface StreamOptions {
+  signal?: AbortSignal;
+  maxBufferBytes?: number;
+  retryAttempts?: number;
+  retryDelayMs?: number;
+}
+
+const DEFAULT_STREAM_BUFFER_BYTES = 1024 * 1024;
+const DEFAULT_STREAM_RETRY_ATTEMPTS = 2;
+const DEFAULT_STREAM_RETRY_DELAY_MS = 300;
 
 export function getOrCreateSessionId(): string {
   let id = localStorage.getItem(SESSION_KEY);
@@ -134,6 +147,7 @@ export async function processTextStream(
   language: string,
   onEvent: (event: ProcessTextStreamEvent) => void,
   onRequestId?: (requestId: string) => void,
+  options?: StreamOptions,
 ): Promise<void> {
   const sessionId = getOrCreateSessionId();
   const lang = normalizeApiLanguage(localStorage.getItem("language") || language || "en");
@@ -141,50 +155,104 @@ export async function processTextStream(
   formData.append("text", text);
   formData.append("session_id", sessionId);
   formData.append("language", lang);
+  const retryAttempts = options?.retryAttempts ?? DEFAULT_STREAM_RETRY_ATTEMPTS;
+  const retryDelayMs = options?.retryDelayMs ?? DEFAULT_STREAM_RETRY_DELAY_MS;
+  const maxBufferBytes = options?.maxBufferBytes ?? DEFAULT_STREAM_BUFFER_BYTES;
 
-  const response = await fetch(`${API_BASE_URL}/api/process-text-stream`, {
-    method: "POST",
-    headers: { "x-language": lang },
-    body: formData,
-  });
-
-  if (!response.ok || !response.body) {
-    throw new Error(`Streaming request failed: ${response.status}`);
-  }
-
-  const requestId = response.headers.get("x-request-id");
-  if (requestId && onRequestId) {
-    onRequestId(requestId);
-  }
-
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) {
-      break;
+  for (let attempt = 1; attempt <= retryAttempts; attempt += 1) {
+    if (options?.signal?.aborted) {
+      return;
     }
 
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split("\n");
-    buffer = lines.pop() || "";
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/process-text-stream`, {
+        method: "POST",
+        headers: { "x-language": lang },
+        body: formData,
+        signal: options?.signal,
+      });
 
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed) {
-        continue;
+      if (!response.ok || !response.body) {
+        throw new Error(`Streaming request failed: ${response.status}`);
       }
-      const parsed = JSON.parse(trimmed) as ProcessTextStreamEvent;
-      onEvent(parsed);
-    }
-  }
 
-  const final = buffer.trim();
-  if (final) {
-    const parsed = JSON.parse(final) as ProcessTextStreamEvent;
-    onEvent(parsed);
+      const requestId = response.headers.get("x-request-id");
+      if (requestId && onRequestId) {
+        onRequestId(requestId);
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+          break;
+        }
+
+        buffer += decoder.decode(value, { stream: true });
+        if (buffer.length > maxBufferBytes) {
+          if (import.meta.env.DEV) {
+            console.warn("[stream] buffer overflow, clearing");
+          }
+          buffer = "";
+        }
+
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed) {
+            continue;
+          }
+          try {
+            const parsed = JSON.parse(trimmed) as ProcessTextStreamEvent;
+            try {
+              onEvent(parsed);
+            } catch (error) {
+              if (import.meta.env.DEV) {
+                console.warn("[stream] event handler failed", error);
+              }
+            }
+          } catch (error) {
+            if (import.meta.env.DEV) {
+              console.warn("[stream] failed to parse event line", error);
+            }
+          }
+        }
+      }
+
+      buffer += decoder.decode();
+      const final = buffer.trim();
+      if (final) {
+        try {
+          const parsed = JSON.parse(final) as ProcessTextStreamEvent;
+          try {
+            onEvent(parsed);
+          } catch (error) {
+            if (import.meta.env.DEV) {
+              console.warn("[stream] event handler failed", error);
+            }
+          }
+        } catch (error) {
+          if (import.meta.env.DEV) {
+            console.warn("[stream] failed to parse final event line", error);
+          }
+        }
+      }
+
+      return;
+    } catch (error) {
+      if (options?.signal?.aborted) {
+        return;
+      }
+      if (attempt >= retryAttempts) {
+        throw error;
+      }
+      await new Promise((resolve) => setTimeout(resolve, retryDelayMs * attempt));
+    }
   }
 }
 

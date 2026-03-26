@@ -4,8 +4,12 @@ from typing import Any, Dict
 import asyncio
 
 import pytesseract
-from openai import OpenAI
 from PIL import Image
+
+try:
+    from openai import OpenAI  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    OpenAI = None
 
 from ..config import get_settings
 from ..logger import log_event
@@ -20,11 +24,13 @@ SYSTEM_PROMPT = (
 )
 
 
-_client: OpenAI | None = None
+_client: Any | None = None
 
 
-def _get_client() -> OpenAI:
+def _get_client() -> Any:
     global _client
+    if OpenAI is None:
+        raise RuntimeError("openai package is not installed")
     if _client is None:
         _client = OpenAI(api_key=SETTINGS.openai_api_key)
     return _client

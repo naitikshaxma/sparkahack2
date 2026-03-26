@@ -4,6 +4,7 @@ from backend.tts_service import split_tts_chunks
 from backend.utils.language import detect_input_language
 from backend.utils.personality import apply_tone, normalize_tone
 from backend.voice_state import clear_interrupt, get_voice_state, interrupt_voice, is_interrupted, set_voice_state
+from backend.routes.voice_routes import tts_interrupt
 
 
 def test_detect_input_language_handles_hinglish_tokens():
@@ -39,6 +40,14 @@ def test_voice_state_interruption_cycle():
     cleared = get_voice_state(session_id)
     assert cleared["state"] == "idle"
     assert cleared["interrupted"] is False
+
+
+def test_tts_interrupt_marks_state():
+    session_id = f"interrupt-route-{uuid.uuid4().hex}"
+    response = tts_interrupt(session_id=session_id)
+    assert response.get("interrupted") is True
+    state = get_voice_state(session_id)
+    assert state["state"] == "interrupted"
 
 
 def test_tts_chunking_splits_long_text():

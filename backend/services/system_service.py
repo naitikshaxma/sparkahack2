@@ -3,7 +3,7 @@ from typing import Any, Dict
 from ..bert_service import get_intent_model_status
 from ..intent_analytics import get_intent_metrics
 from ..logger import log_event
-from ..metrics import get_metrics_snapshot
+from ..metrics import get_metrics_snapshot, get_public_metrics
 from ..rag_service import get_rag_status
 from ..utils.session_manager import get_session_store_status
 from ..whisper_service import get_whisper_status
@@ -59,7 +59,9 @@ class SystemService:
 
     def metrics(self) -> Dict[str, Any]:
         log_event("system_metrics_start", endpoint="system_service", status="success")
+        public = get_public_metrics()
         payload = {
+            **public,
             "observability": get_metrics_snapshot(),
             "intent": get_intent_metrics(),
             "session_store": get_session_store_status(),

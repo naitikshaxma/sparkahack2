@@ -15,4 +15,8 @@ python-dotenv
 rapidfuzz
 pytesseract
 pillow
+requests
 pytest
+sqlalchemy==2.0.38
+psycopg2-binary==2.9.10
+PyJWT==2.10.1

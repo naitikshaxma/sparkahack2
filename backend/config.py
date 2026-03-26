@@ -77,6 +77,15 @@ class Settings:
     trust_proxy_headers: bool
     enable_api_key_auth: bool
     api_auth_key: str
+    database_url: str
+    jwt_secret_key: str
+    jwt_algorithm: str
+    jwt_expiration_minutes: int
+    jwt_required_for_protected_routes: bool
+    jwt_protected_prefixes: tuple[str, ...]
+    frontend_dev_origin: str
+    frontend_production_origin: str
+    cors_allow_origins: tuple[str, ...]
 
     def validate_runtime(self) -> None:
         if not self.openai_api_key:
@@ -109,9 +118,29 @@ class Settings:
             if _is_placeholder(self.api_auth_key):
                 raise RuntimeError("API_AUTH_KEY uses a placeholder/default value. Refusing startup.")
 
+        if self.jwt_required_for_protected_routes:
+            if not self.jwt_secret_key:
+                raise RuntimeError("JWT_SECRET_KEY is required when JWT_REQUIRED_FOR_PROTECTED_ROUTES=true.")
+            if _is_placeholder(self.jwt_secret_key):
+                raise RuntimeError("JWT_SECRET_KEY uses a placeholder/default value. Refusing startup.")
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
+    raw_prefixes = (os.getenv("JWT_PROTECTED_PREFIXES") or "/api/private,/api/v1/private").strip()
+    jwt_protected_prefixes = tuple(prefix.strip() for prefix in raw_prefixes.split(",") if prefix.strip())
+    frontend_dev_origin = (os.getenv("FRONTEND_DEV_ORIGIN") or "http://127.0.0.1:5173").strip()
+    frontend_production_origin = (os.getenv("FRONTEND_PRODUCTION_ORIGIN") or "https://voice-os-bharat.com").strip()
+    raw_cors_origins = (os.getenv("CORS_ALLOW_ORIGINS") or "").strip()
+    if raw_cors_origins:
+        cors_allow_origins = tuple(origin.strip() for origin in raw_cors_origins.split(",") if origin.strip())
+    else:
+        cors_allow_origins = tuple(
+            origin
+            for origin in (frontend_dev_origin, frontend_production_origin)
+            if origin
+        )
+
     return Settings(
         openai_api_key=(os.getenv("OPENAI_API_KEY") or "").strip(),
         openai_chat_model=(os.getenv("OPENAI_CHAT_MODEL") or "gpt-4o-mini").strip(),
@@ -124,10 +153,19 @@ def get_settings() -> Settings:
         max_text_input_chars=_as_int("MAX_TEXT_INPUT_CHARS", 500),
         max_session_id_chars=_as_int("MAX_SESSION_ID_CHARS", 64),
         api_rate_limit_window_seconds=_as_int("API_RATE_LIMIT_WINDOW_SECONDS", 60),
-        api_rate_limit_max_requests=_as_int("API_RATE_LIMIT_MAX_REQUESTS", 80),
+        api_rate_limit_max_requests=_as_int("API_RATE_LIMIT_MAX_REQUESTS", 100),
         api_key_rate_limit_max_requests=_as_int("API_KEY_RATE_LIMIT_MAX_REQUESTS", 120),
         max_request_size_bytes=_as_int("MAX_REQUEST_SIZE_BYTES", 1048576),
         trust_proxy_headers=_as_bool(os.getenv("TRUST_PROXY_HEADERS"), False),
         enable_api_key_auth=_as_bool(os.getenv("ENABLE_API_KEY_AUTH"), False),
         api_auth_key=(os.getenv("API_AUTH_KEY") or "").strip(),
+        database_url=(os.getenv("POSTGRES_URL") or os.getenv("DATABASE_URL") or "").strip(),
+        jwt_secret_key=(os.getenv("JWT_SECRET_KEY") or "dev-jwt-secret-change-me").strip(),
+        jwt_algorithm=(os.getenv("JWT_ALGORITHM") or "HS256").strip(),
+        jwt_expiration_minutes=_as_int("JWT_EXPIRATION_MINUTES", 60),
+        jwt_required_for_protected_routes=_as_bool(os.getenv("JWT_REQUIRED_FOR_PROTECTED_ROUTES"), False),
+        jwt_protected_prefixes=jwt_protected_prefixes,
+        frontend_dev_origin=frontend_dev_origin,
+        frontend_production_origin=frontend_production_origin,
+        cors_allow_origins=cors_allow_origins,
     )

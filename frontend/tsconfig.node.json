@@ -6,6 +6,6 @@
     "moduleResolution": "Bundler",
     "allowSyntheticDefaultImports": true
   },
-  "include": ["vite.config.ts", "tailwind.config.ts"]
+  "include": ["vite.config.js", "tailwind.config.ts"]
 }
 

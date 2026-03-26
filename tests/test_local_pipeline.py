@@ -75,8 +75,12 @@ def run_pipeline_test() -> None:
         if quick_actions and not all(isinstance(item, dict) and "label" in item and "value" in item for item in quick_actions):
             raise RuntimeError("quick_actions must contain objects with label/value.")
 
-        if not isinstance(payload["audio_base64"], str) or not payload["audio_base64"].startswith("data:audio/mp3;base64,"):
-            raise RuntimeError("audio_base64 is missing expected mp3 base64 data URI.")
+        audio_base64 = payload.get("audio_base64")
+        if audio_base64 is not None:
+            if not isinstance(audio_base64, str) or not audio_base64.startswith("data:audio/mp3;base64,"):
+                raise RuntimeError("audio_base64 is missing expected mp3 base64 data URI.")
+        else:
+            print("audio_base64 missing; TTS fallback likely used.")
 
         intent_response = requests.post(
             f"{BACKEND_URL}/api/intent",

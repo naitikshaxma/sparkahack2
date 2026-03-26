@@ -66,6 +66,39 @@ def sanitize_history_for_storage(history: List[Dict[str, Any]]) -> List[Dict[str
     return cleaned_history[-10:]
 
 
+def _sanitize_semantic_memory(memory: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    cleaned: List[Dict[str, Any]] = []
+    for item in memory or []:
+        if not isinstance(item, dict):
+            continue
+
+        entities = item.get("entities")
+        if not isinstance(entities, dict):
+            entities = {}
+
+        schemes = [str(s).strip() for s in (entities.get("schemes") or []) if str(s).strip()]
+        numbers: List[str] = []
+        for raw in entities.get("numbers") or []:
+            digits = digits_only(str(raw))
+            if not digits:
+                continue
+            if len(digits) >= 8:
+                numbers.append(mask_aadhaar(digits))
+            else:
+                numbers.append(digits)
+
+        cleaned.append(
+            {
+                "ts": item.get("ts"),
+                "intent": str(item.get("intent") or "").strip(),
+                "entities": {"schemes": schemes, "numbers": numbers},
+                "user_input": redact_sensitive_text(str(item.get("user_input") or "")),
+                "assistant_summary": redact_sensitive_text(str(item.get("assistant_summary") or "")),
+            }
+        )
+    return cleaned
+
+
 def sanitize_session_payload(session_data: Dict[str, Any]) -> Dict[str, Any]:
     payload = dict(session_data or {})
 
@@ -80,6 +113,12 @@ def sanitize_session_payload(session_data: Dict[str, Any]) -> Dict[str, Any]:
         payload["conversation_history"] = sanitize_history_for_storage(history)
     else:
         payload["conversation_history"] = []
+
+    semantic_memory = payload.get("semantic_memory")
+    if isinstance(semantic_memory, list):
+        payload["semantic_memory"] = _sanitize_semantic_memory(semantic_memory)
+    elif "semantic_memory" in payload:
+        payload["semantic_memory"] = []
 
     # Do not persist raw OCR payloads.
     payload.pop("ocr_text", None)

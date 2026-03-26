@@ -32,7 +32,7 @@ Request flow:
 python -m venv .venv
 .\.venv\Scripts\activate
 pip install -r requirements.txt
-uvicorn backend.main:app --reload --host 127.0.0.1 --port 8000
+uvicorn backend.main:app --reload --host 127.0.0.1 --port 8099
 ```
 
 ### 2. Frontend
@@ -47,6 +47,20 @@ npm run dev -- --host 127.0.0.1 --port 5173
 Copy-Item .env.example .env
 ```
 Update `.env` if you need custom runtime values.
+Optional overrides:
+- `CORS_ALLOW_ORIGINS` to control allowed frontend origins
+- `SESSION_STORE_BACKEND` to force `auto|redis|memory`
+- `TTS_RETRY_ATTEMPTS` to retry transient TTS failures
+- `TTS_RETRY_BACKOFF_MS` for TTS retry backoff in milliseconds
+- `STREAM_CHUNK_DELAY_MS` to throttle streaming chunk emission (ms)
+- `VITE_DEV_BACKEND_URL` to control the Vite proxy target
+- `VITE_DEV_PORT` to control the Vite dev server port
+- `MAX_CONCURRENT_REQUESTS` to cap concurrent API requests
+- `CONCURRENCY_ACQUIRE_TIMEOUT_SECONDS` to limit semaphore wait time
+- `REQUEST_TIMEOUT_SECONDS` for non-streaming endpoint timeouts
+- `STREAM_MAX_DURATION_SECONDS` for streaming endpoint max duration
+- `MAX_VOICE_STATE_ENTRIES` to cap voice state cache size
+- `MAX_ASYNC_LOCKS` to cap async session lock cache
 
 Security notes:
 - Backend startup validates critical env values and fails fast if required secrets are missing or placeholders.
@@ -99,6 +113,8 @@ If a secret is exposed, follow [docs/SECRET_HISTORY_CLEANUP.md](docs/SECRET_HIST
 - Frontend runtime endpoints are configured through environment variables:
   - `VITE_API_BASE_URL`
   - `VITE_BACKEND_URL` (backward-compatible alias)
+  - `VITE_DEV_BACKEND_URL` (dev proxy target for Vite)
+  - `VITE_DEV_PORT` (dev server port override)
 - Production template: [frontend/.env.production](frontend/.env.production)
 
 ## Documentation Index

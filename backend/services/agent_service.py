@@ -1,7 +1,10 @@
 import json
 from typing import Any, Dict
 
-from openai import OpenAI
+try:
+    from openai import OpenAI  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    OpenAI = None
 
 from ..config import get_settings
 from ..utils.language import normalize_language_code
@@ -28,12 +31,14 @@ SYSTEM_PROMPT = (
 )
 
 
-_client: OpenAI | None = None
+_client: Any | None = None
 MAX_HISTORY_MESSAGES = 10
 
 
-def _get_client() -> OpenAI:
+def _get_client() -> Any:
     global _client
+    if OpenAI is None:
+        raise RuntimeError("openai package is not installed")
     if _client is None:
         _client = OpenAI(api_key=SETTINGS.openai_api_key)
     return _client

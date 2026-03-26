@@ -93,6 +93,62 @@ _INTENT_ALIASES = {
     "fallback": INTENT_GENERAL_QUERY,
 }
 
+_KEYWORD_SIGNALS = {
+    INTENT_APPLY_LOAN: {
+        "loan",
+        "apply loan",
+        "loan apply",
+        "application",
+        "apply",
+        "form fill",
+        "aavedan",
+        "आवेदन",
+        "लोन",
+    },
+    INTENT_CHECK_APPLICATION_STATUS: {
+        "status",
+        "track",
+        "application status",
+        "check status",
+        "स्थिति",
+    },
+    INTENT_REGISTER_COMPLAINT: {
+        "complaint",
+        "grievance",
+        "issue",
+        "problem",
+        "शिकायत",
+    },
+    INTENT_ACCOUNT_BALANCE: {
+        "balance",
+        "account balance",
+        "bank balance",
+        "बैलेंस",
+    },
+    INTENT_SCHEME_QUERY: {
+        "scheme",
+        "yojana",
+        "eligibility",
+        "benefits",
+        "documents",
+        "scheme batao",
+        "loan batao",
+        "madad",
+        "help",
+        "सरकारी योजना",
+        "योजना",
+    },
+}
+
+_GENERIC_HELP_PHRASES = {
+    "loan batao",
+    "scheme batao",
+    "madad chahiye",
+    "help chahiye",
+    "kuch batao",
+    "koi yojana",
+}
+
 
 def _normalize_label(label: Optional[str]) -> str:
     cleaned = (label or "").strip().lower()
@@ -131,6 +187,25 @@ def get_intent_threshold(intent: str) -> float:
     return float(INTENT_CONFIDENCE_THRESHOLDS.get(intent, INTENT_CONFIDENCE_THRESHOLD))
 
 
+def get_flexible_intent_threshold(intent: str, text: str = "") -> float:
+    base = get_intent_threshold(intent)
+    query = (text or "").strip().lower()
+    if not query:
+        return min(0.5, max(0.2, base))
+
+    tokens = query.split()
+    if len(tokens) <= 2:
+        base -= 0.06
+
+    if intent == INTENT_SCHEME_QUERY and any(phrase in query for phrase in _GENERIC_HELP_PHRASES):
+        base -= 0.08
+
+    if intent in ACTION_INTENTS and "apply" in query:
+        base -= 0.04
+
+    return max(0.18, min(0.75, float(base)))
+
+
 def calibrate_confidence(score: float, intent: str, text: str = "") -> Tuple[float, bool]:
     calibrated = max(0.0, min(1.0, float(score)))
     lowered = (text or "").strip().lower()
@@ -152,13 +227,36 @@ def calibrate_confidence(score: float, intent: str, text: str = "") -> Tuple[flo
     return calibrated, strong_keyword_hit
 
 
+def keyword_intent_signal(text: str) -> Tuple[str, float, bool]:
+    query = (text or "").strip().lower()
+    if not query:
+        return INTENT_GENERAL_QUERY, 0.0, False
+
+    scored: list[tuple[str, float]] = []
+    for intent, keywords in _KEYWORD_SIGNALS.items():
+        score = 0.0
+        for keyword in keywords:
+            if keyword in query:
+                score += 2.0 if " " in keyword else 1.0
+        if score > 0:
+            scored.append((intent, score))
+
+    if not scored:
+        return INTENT_GENERAL_QUERY, 0.0, False
+
+    scored.sort(key=lambda item: item[1], reverse=True)
+    top_intent, raw_score = scored[0]
+    confidence = min(1.0, 0.45 + (raw_score * 0.12))
+    return top_intent, confidence, True
+
+
 def apply_confidence_fallback(
     intent: str,
     confidence: float,
     threshold: float = INTENT_CONFIDENCE_THRESHOLD,
 ) -> Tuple[str, bool]:
     resolved_threshold = threshold if threshold != INTENT_CONFIDENCE_THRESHOLD else get_intent_threshold(intent)
-    if confidence < resolved_threshold and intent != INTENT_SCHEME_QUERY:
+    if confidence < resolved_threshold and intent not in {INTENT_SCHEME_QUERY, INTENT_GENERAL_QUERY}:
         return INTENT_GENERAL_QUERY, True
     return intent, False
 
@@ -172,5 +270,6 @@ def normalize_intent_prediction(
     migrated, _ = migrate_intent(raw_intent)
     canonical_intent, _ = normalize_intent(migrated or raw_intent)
     calibrated_confidence, _ = calibrate_confidence(float(confidence), canonical_intent, text)
-    canonical_intent, used_fallback = apply_confidence_fallback(canonical_intent, calibrated_confidence, threshold=threshold)
+    dynamic_threshold = threshold if threshold != INTENT_CONFIDENCE_THRESHOLD else get_flexible_intent_threshold(canonical_intent, text)
+    canonical_intent, used_fallback = apply_confidence_fallback(canonical_intent, calibrated_confidence, threshold=dynamic_threshold)
     return canonical_intent, float(calibrated_confidence), used_fallback

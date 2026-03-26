@@ -1,6 +1,53 @@
 {
-  "full_name": "#fullName",
-  "phone": "#phone",
-  "aadhaar_number": "#aadhaar",
-  "annual_income": "#income"
+  "default": {
+    "form_url": "/demo-form",
+    "field_map": {
+      "full_name": ["#fullName", "input[name='full_name']", "[placeholder='Name']"],
+      "phone": ["#phone", "input[name='phone']", "input[type='tel']"],
+      "aadhaar_number": ["#aadhaar", "input[name='aadhaar_number']", "[placeholder*='Aadhaar' i]"],
+      "annual_income": ["#income", "input[name='annual_income']", "[placeholder*='Income' i]"]
+    }
+  },
+  "pm kisan": {
+    "form_url": "/demo-form",
+    "field_map": {
+      "full_name": ["#fullName", "input[name='full_name']", "[placeholder='Name']"],
+      "phone": ["#phone", "input[name='phone']", "input[type='tel']"],
+      "aadhaar_number": ["#aadhaar", "input[name='aadhaar_number']", "[placeholder*='Aadhaar' i]"],
+      "annual_income": ["#income", "input[name='annual_income']", "[placeholder*='Income' i]"],
+      "land_holding_acres": ["#landHolding", "input[name='land_holding_acres']", "[placeholder*='Land' i]"],
+      "farmer_id": ["#farmerId", "input[name='farmer_id']", "[placeholder*='Farmer' i]"]
+    }
+  },
+  "ayushman bharat": {
+    "form_url": "/demo-form",
+    "field_map": {
+      "full_name": ["#fullName", "input[name='full_name']", "[placeholder='Name']"],
+      "phone": ["#phone", "input[name='phone']", "input[type='tel']"],
+      "aadhaar_number": ["#aadhaar", "input[name='aadhaar_number']", "[placeholder*='Aadhaar' i]"],
+      "annual_income": ["#income", "input[name='annual_income']", "[placeholder*='Income' i]"],
+      "family_size": ["#familySize", "input[name='family_size']", "[placeholder*='Family' i]"],
+      "health_card_number": ["#healthCard", "input[name='health_card_number']", "[placeholder*='Health' i]"]
+    }
+  },
+  "pmay": {
+    "form_url": "/demo-form",
+    "field_map": {
+      "full_name": ["#fullName", "input[name='full_name']", "[placeholder='Name']"],
+      "phone": ["#phone", "input[name='phone']", "input[type='tel']"],
+      "aadhaar_number": ["#aadhaar", "input[name='aadhaar_number']", "[placeholder*='Aadhaar' i]"],
+      "annual_income": ["#income", "input[name='annual_income']", "[placeholder*='Income' i]"],
+      "residential_status": ["#residentialStatus", "input[name='residential_status']", "[placeholder*='Residential' i]"],
+      "property_ownership": ["#propertyOwnership", "input[name='property_ownership']", "[placeholder*='Property' i]"]
+    }
+  },
+  "loan assistance": {
+    "form_url": "/demo-form",
+    "field_map": {
+      "full_name": ["#fullName", "input[name='full_name']", "[placeholder='Name']"],
+      "phone": ["#phone", "input[name='phone']", "input[type='tel']"],
+      "aadhaar_number": ["#aadhaar", "input[name='aadhaar_number']", "[placeholder*='Aadhaar' i]"],
+      "annual_income": ["#income", "input[name='annual_income']", "[placeholder*='Income' i]"]
+    }
+  }
 }

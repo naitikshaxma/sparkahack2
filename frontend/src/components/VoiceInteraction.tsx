@@ -58,6 +58,8 @@ type SpeechRecognitionEventLike = {
   }>;
 };
 
+const MAX_AUDIO_QUEUE = 24;
+
 function getSpeechRecognitionCtor(): (new () => SpeechRecognitionLike) | null {
   const win = window as Window & {
     SpeechRecognition?: new () => SpeechRecognitionLike;
@@ -120,6 +122,7 @@ const VoiceInteraction = ({ language, onBack }: VoiceInteractionProps) => {
   const typingQueueRef = useRef<string[]>([]);
   const typingTimerRef = useRef<number | null>(null);
   const activeTurnIdRef = useRef<string | null>(null);
+  const streamAbortRef = useRef<AbortController | null>(null);
 
   const quickPrompts = useMemo(() => {
     if (demoMode) {
@@ -233,6 +236,19 @@ const VoiceInteraction = ({ language, onBack }: VoiceInteractionProps) => {
     audioRef.current = null;
   }, [stopTyping]);
 
+  const abortActiveStream = useCallback(() => {
+    if (streamAbortRef.current) {
+      streamAbortRef.current.abort();
+      streamAbortRef.current = null;
+    }
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      abortActiveStream();
+    };
+  }, [abortActiveStream]);
+
   const playQueue = useCallback(async () => {
     if (drainingQueueRef.current) {
       return;
@@ -271,6 +287,10 @@ const VoiceInteraction = ({ language, onBack }: VoiceInteractionProps) => {
     }
 
     stopListening();
+    if (audioQueueRef.current.length >= MAX_AUDIO_QUEUE) {
+      audioQueueRef.current = audioQueueRef.current.slice(-Math.floor(MAX_AUDIO_QUEUE / 2));
+      logFrontendEvent("audio_queue_trimmed", { size: audioQueueRef.current.length }, getOrCreateSessionId());
+    }
     audioQueueRef.current.push({ audio: audioBase64, text: textSegment });
     setVoiceState("speaking");
     void playQueue();
@@ -343,6 +363,7 @@ const VoiceInteraction = ({ language, onBack }: VoiceInteractionProps) => {
       }
       lastTranscriptRef.current = { text: cleaned, ts: now };
 
+      abortActiveStream();
       setFinalTranscript(cleaned);
       setLiveTranscript("");
       const inputLanguage = detectTextLanguage(cleaned);
@@ -367,6 +388,9 @@ const VoiceInteraction = ({ language, onBack }: VoiceInteractionProps) => {
       setErrorState(null);
       setResponseText("");
 
+      let doneSeen = false;
+      const controller = new AbortController();
+      streamAbortRef.current = controller;
       try {
         await processTextStream(
           cleaned,
@@ -396,11 +420,14 @@ const VoiceInteraction = ({ language, onBack }: VoiceInteractionProps) => {
             }
 
             if (event.type === "interrupted") {
+              abortActiveStream();
+              stopAudio();
               setVoiceState("interrupted");
               return;
             }
 
             if (event.type === "done") {
+              doneSeen = true;
               setStreamDone(true);
               logFrontendEvent("stream_done", { requestId }, getOrCreateSessionId());
               if (!drainingQueueRef.current && audioQueueRef.current.length === 0) {
@@ -412,7 +439,18 @@ const VoiceInteraction = ({ language, onBack }: VoiceInteractionProps) => {
             setRequestId(incomingRequestId);
             updateConversationAssistantText(turnId, useVoiceStore.getState().responseText || "");
           },
+          {
+            signal: controller.signal,
+            retryAttempts: 2,
+            retryDelayMs: 300,
+          },
         );
+        if (!doneSeen && requestId === requestCounterRef.current && !controller.signal.aborted) {
+          setStreamDone(true);
+          if (!drainingQueueRef.current && audioQueueRef.current.length === 0) {
+            setVoiceState("idle");
+          }
+        }
       } catch {
         try {
           const response = await processText(cleaned, uiLanguage);
@@ -441,10 +479,14 @@ const VoiceInteraction = ({ language, onBack }: VoiceInteractionProps) => {
           logFrontendEvent("error", { phase: "process_text" }, getOrCreateSessionId());
         }
       } finally {
+        if (streamAbortRef.current === controller) {
+          streamAbortRef.current = null;
+        }
         endLatencyTracking();
       }
     },
     [
+      abortActiveStream,
       beginLatencyTracking,
       addConversationTurn,
       clearResponseStream,
@@ -454,6 +496,7 @@ const VoiceInteraction = ({ language, onBack }: VoiceInteractionProps) => {
       markFirstAudioChunk,
       markFirstResponse,
       playAudioFromBase64,
+      stopAudio,
       setBackendResponse,
       setDetectedLanguage,
       setErrorState,

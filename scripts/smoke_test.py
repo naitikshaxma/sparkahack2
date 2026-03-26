@@ -25,7 +25,7 @@ def wait_for_health(base_url: str, timeout_seconds: int = 60) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Backend smoke test")
     parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8012)
+    parser.add_argument("--port", type=int, default=8099)
     args = parser.parse_args()
 
     root = Path(__file__).resolve().parent.parent

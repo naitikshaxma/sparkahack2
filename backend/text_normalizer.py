@@ -1,5 +1,8 @@
 import re
 import unicodedata
+from dataclasses import dataclass
+from typing import List, Optional
+
 
 PHRASE_MAP = {
     "प्रधानमंत्री किसान सम्मान निधि योजना": "pm kisan scheme",
@@ -13,6 +16,9 @@ PHRASE_MAP = {
     "kisan yojana": "kisan scheme",
     "आयुष्मान भारत योजना": "ayushman bharat scheme",
     "आयुष्मान भारत": "ayushman bharat",
+    "प्रधानमंत्री आवास योजना": "pmay scheme",
+    "आवास योजना": "housing scheme",
+    "वृद्धा पेंशन": "old age pension",
     "राशन कार्ड योजना": "ration card scheme",
     "राशन कार्ड": "ration card",
     "راشن کارڈ": "ration card",
@@ -28,35 +34,40 @@ WORD_MAP = {
     "kisaan": "kisan",
     "kissan": "kisan",
     "kisan": "kisan",
-    "کسان": "kisan",
     "योजना": "scheme",
     "योजनाएं": "scheme",
     "योजनाओं": "scheme",
     "yojana": "scheme",
     "yojna": "scheme",
     "scheme": "scheme",
-    "یوجنا": "scheme",
-    "راشن": "ration",
-    "राशन": "ration",
-    "rashan": "ration",
-    "raashan": "ration",
-    "rashani": "ration",
-    "raashani": "ration",
-    "rashaani": "ration",
-    "ration": "ration",
-    "कार्ड": "card",
-    "कार्डों": "card",
-    "card": "card",
-    "kard": "card",
-    "kardr": "card",
-    "cardr": "card",
-    "کارڈ": "card",
+    "loan": "loan",
+    "rin": "loan",
+    "ऋण": "loan",
+    "लोन": "loan",
+    "madad": "help",
+    "मदद": "help",
+    "sahayata": "help",
+    "सहायता": "help",
+    "apply": "apply",
+    "aavedan": "apply",
+    "आवेदन": "apply",
+    "status": "status",
+    "स्थिति": "status",
+    "eligibility": "eligibility",
+    "पात्रता": "eligibility",
+    "benefits": "benefits",
+    "लाभ": "benefits",
+    "documents": "documents",
+    "दस्तावेज": "documents",
+    "document": "documents",
     "आयुष्मान": "ayushman",
     "ayushman": "ayushman",
-    "ایوشمان": "ayushman",
     "भारत": "bharat",
     "bharat": "bharat",
-    "بھارت": "bharat",
+    "राशन": "ration",
+    "rashan": "ration",
+    "कार्ड": "card",
+    "card": "card",
 }
 
 STOPWORDS = {
@@ -82,8 +93,9 @@ STOPWORDS = {
     "hai",
     "hain",
     "ho",
-    "kese",
-    "kaise",
+    "hoga",
+    "please",
+    "plz",
     "about",
     "batao",
     "bataye",
@@ -92,18 +104,31 @@ STOPWORDS = {
     "बताएं",
     "बताइए",
     "बताओ",
-    "banwaye",
-    "banvaye",
-    "banvayen",
     "जानकारी",
     "जानना",
-    "बारे",
-    "ہو",
-    "کے",
-    "میں",
-    "کیا",
-    "کیسے",
+    "bhi",
+    "भी",
 }
+
+HINDI_SIGNAL_TOKENS = {
+    "kya",
+    "kaise",
+    "yojana",
+    "madad",
+    "aavedan",
+    "haan",
+    "nahi",
+    "ji",
+}
+
+
+@dataclass(frozen=True)
+class NormalizedInput:
+    raw_text: str
+    normalized_text: str
+    intent_text: str
+    language: str
+    tokens: List[str]
 
 
 def _replace_phrases(text: str) -> str:
@@ -113,22 +138,58 @@ def _replace_phrases(text: str) -> str:
     return output
 
 
-def normalize_text(text: str) -> str:
-    raw = unicodedata.normalize("NFKC", str(text or "")).lower().strip()
-    if not raw:
-        return ""
+def detect_text_language(text: str, language_hint: Optional[str] = None) -> str:
+    hint = (language_hint or "").strip().lower()
+    if hint in {"hi", "en"}:
+        return hint
 
-    normalized = _replace_phrases(raw)
-    normalized = re.sub(r"[^\w\s\u0900-\u097f\u0600-\u06ff]", " ", normalized)
+    content = unicodedata.normalize("NFKC", str(text or "")).strip().lower()
+    if not content:
+        return "en"
+
+    if re.search(r"[\u0900-\u097F]", content):
+        return "hi"
+
+    tokens = set(content.split())
+    if tokens.intersection(HINDI_SIGNAL_TOKENS):
+        return "hi"
+    return "en"
+
+
+def _tokenize_core(text: str) -> List[str]:
+    normalized = _replace_phrases(text)
+    normalized = re.sub(r"[^\w\s\u0900-\u097f]", " ", normalized)
     normalized = re.sub(r"\s+", " ", normalized).strip()
 
-    mapped_tokens = []
+    tokens: List[str] = []
     for token in normalized.split():
         mapped = WORD_MAP.get(token, token)
         if mapped in STOPWORDS:
             continue
-        if mapped_tokens and mapped_tokens[-1] == mapped:
+        if tokens and tokens[-1] == mapped:
             continue
-        mapped_tokens.append(mapped)
+        tokens.append(mapped)
+    return tokens
 
-    return " ".join(mapped_tokens).strip()
+
+def normalize_text(text: str) -> str:
+    raw = unicodedata.normalize("NFKC", str(text or "")).lower().strip()
+    if not raw:
+        return ""
+    return " ".join(_tokenize_core(raw)).strip()
+
+
+def normalize_for_intent(text: str, language_hint: Optional[str] = None) -> NormalizedInput:
+    raw_text = unicodedata.normalize("NFKC", str(text or "")).strip()
+    lowered = raw_text.lower()
+    normalized_text = normalize_text(lowered)
+    intent_text = normalized_text or re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", lowered)).strip()
+    tokens = intent_text.split() if intent_text else []
+    language = detect_text_language(raw_text, language_hint=language_hint)
+    return NormalizedInput(
+        raw_text=raw_text,
+        normalized_text=normalized_text,
+        intent_text=intent_text,
+        language=language,
+        tokens=tokens,
+    )
