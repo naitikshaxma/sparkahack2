@@ -2,7 +2,9 @@ import math
 
 import pytest
 
-from backend import decision_engine, eligibility_engine, rag_service
+from backend.application.engines import decision as decision_engine
+from backend.application.engines import eligibility as eligibility_engine
+from backend.infrastructure.ml import rag_service
 from backend.utils import form_schema
 
 

@@ -3,8 +3,8 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from ..auth import create_access_token, get_authenticated_user
-from ..config import get_settings
-from ..db import db_session_scope
+from backend.core.config import get_settings
+from backend.infrastructure.database.connection import db_session_scope
 from ..models.api_models import LoginRequest
 from ..models.db_models import User
 from .response_utils import standardized_success

@@ -2,7 +2,7 @@ import time
 import asyncio
 from typing import Any, Dict, Tuple
 
-from ..bert_service import predict_intent_detailed
+from backend.infrastructure.ml.bert_service import predict_intent_detailed
 from ..intents import (
     INTENT_GENERAL_QUERY,
     INTENT_SCHEME_QUERY,
@@ -10,8 +10,8 @@ from ..intents import (
     keyword_intent_signal,
     normalize_intent,
 )
-from ..logger import log_event
-from ..metrics import record_fallback
+from backend.core.logger import log_event
+from backend.core.metrics import record_fallback
 from ..text_normalizer import normalize_for_intent
 
 

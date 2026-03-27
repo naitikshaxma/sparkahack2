@@ -10,7 +10,7 @@ from typing import Any
 
 from fastapi import HTTPException, Request
 
-from .db import db_session_scope
+from backend.infrastructure.database.connection import db_session_scope
 from .models.db_models import User
 
 _CURRENT_USER_ID: ContextVar[str] = ContextVar("current_user_id", default="")

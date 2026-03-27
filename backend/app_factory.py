@@ -11,18 +11,20 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from .auth import clear_current_user_id, decode_access_token, extract_bearer_token, set_current_user_id
-from .config import get_settings
-from .db import init_db
-from .logger import clear_request_context, configure_logging, log_event, log_exception, set_request_context
-from .metrics import record_error, record_request
+from backend.core.config import get_settings
+from backend.infrastructure.database.connection import init_db
+from backend.core.logger import clear_request_context, configure_logging, log_event, log_exception, set_request_context
+from backend.core.metrics import record_error, record_request
 from .routes.auth_routes import router as auth_router
-from .routes.intent_routes import router as intent_router
+from backend.api.v1.routes.intent import router as intent_router
+from backend.api.v1.routes.health import router as health_router
 from .routes.response_utils import standardized_error
 from .routes.system_routes import router as system_router
 from .routes.voice_routes import router as voice_router
-from .rag_service import warmup_rag_resources
+from backend.api.v1.routes.voice_ws import router as voice_ws_router
+from backend.infrastructure.ml.rag_service import warmup_rag_resources
 from .utils.rate_limit import allow_request
-from .whisper_service import warmup_whisper
+from backend.infrastructure.ml.whisper_service import warmup_whisper
 
 
 def create_app() -> FastAPI:
@@ -76,6 +78,20 @@ def create_app() -> FastAPI:
                     error_type=type(exc).__name__,
                 )
         warmup_whisper()
+
+        # Phase 9: Start stuck-job sweeper as a non-blocking background coroutine
+        try:
+            from backend.infrastructure.monitoring.sweeper import run_sweeper
+            asyncio.ensure_future(run_sweeper())
+            log_event("sweeper_started", level="info", endpoint="startup", status="success")
+        except Exception as exc:
+            log_event(
+                "sweeper_start_failed",
+                level="warning",
+                endpoint="startup",
+                status="failure",
+                error_type=type(exc).__name__,
+            )
 
     def _extract_client_ip(request: Request) -> str:
         if settings.trust_proxy_headers:
@@ -414,5 +430,12 @@ def create_app() -> FastAPI:
 
     app.include_router(system_router)
     app.include_router(system_router, prefix="/api/v1")
+
+    # Phase 7: Async WebSocket pipeline (Redis-backed with sync fallback)
+    app.include_router(voice_ws_router, prefix="/api/v1")
+    app.include_router(voice_ws_router)  # also available at /ws/voice/{session_id}
+
+    # Phase 9: Observability endpoints
+    app.include_router(health_router, prefix="/api/v1")
 
     return app

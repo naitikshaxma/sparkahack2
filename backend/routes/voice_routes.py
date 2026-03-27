@@ -17,16 +17,16 @@ from PIL import Image, UnidentifiedImageError
 from ..application.use_cases.voice.synthesize_tts import synthesize_tts as synthesize_tts_use_case
 from ..application.use_cases.voice.transcribe_audio import transcribe_audio as transcribe_audio_use_case
 from ..container import inject_container
-from ..metrics import record_automation_result, record_timing
+from backend.core.metrics import record_automation_result, record_timing
 from ..models.api_models import AutofillRequest, ResetSessionRequest, TTSRequest
-from ..logger import log_event
-from ..tts_service import split_tts_chunks
+from backend.core.logger import log_event
+from backend.infrastructure.ml.tts_service import split_tts_chunks
 from ..utils.language import detect_input_language, detect_text_language, normalize_language_code
 from ..utils.personality import apply_tone, normalize_tone
 from ..utils.privacy import redact_sensitive_text, sanitize_profile_for_response
 from ..utils.rate_limit import allow_request
 from ..utils.session_manager import create_session, delete_session, get_async_session_lock, get_session, update_session
-from ..voice_analytics import record_interruption, record_latency_perception, record_retry, record_stt_signal, snapshot
+from backend.core.voice_analytics import record_interruption, record_latency_perception, record_retry, record_stt_signal, snapshot
 from ..voice_state import begin_stream, clear_interrupt, end_stream, get_voice_state, interrupt_voice, is_interrupted, is_stream_active, set_voice_state
 from .response_utils import standardized_success
 

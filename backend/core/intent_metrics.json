@@ -1,0 +1,11 @@
+{
+  "intent_frequency": {
+    "scheme_query": 7,
+    "check_application_status": 3,
+    "apply_loan": 3,
+    "general_query": 6
+  },
+  "fallback_frequency": 0,
+  "unknown_intents": {},
+  "low_confidence_cases": 0
+}

@@ -1,15 +1,81 @@
-node_modules/
-**pycache**/
-.env
-.env.*
-!.env.example
-.venv/
-models/
-*.wav
-*.mp3
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
 dist/
+build/
+.eggs/
+*.so
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── Environment variables ─────────────────────────────────────────────────────
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# ── Node / Frontend ───────────────────────────────────────────────────────────
+node_modules/
+dist/
+build/
+.cache/
+*.tsbuildinfo
+frontend/.env
+!frontend/.env.example
+!frontend/.env.production
+
+# ── IDE & tooling ─────────────────────────────────────────────────────────────
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ── VS Code (keep project-level settings, ignore personal) ───────────────────
+.vscode/*
+!.vscode/settings.json
+
+# ── Type checkers ─────────────────────────────────────────────────────────────
+.mypy_cache/
+.pyre/
+.pyright/
+
+# ── Test & coverage ───────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.tox/
+
+# ── Logs & temp ───────────────────────────────────────────────────────────────
 *.log
-voice-os-bharat/
-.vscode/
-.gitleaks-report.json
-backend/intent_metrics.json
+*.log.*
+logs/
+tmp/
+temp/
+
+# ── Binary tools (never commit executables) ──────────────────────────────────
+tools/*.exe
+tools/*.bin
+
+# ── Generated snapshot files ──────────────────────────────────────────────────
+tree_output*.txt
+
+# ── Datasets (large — use DVC or object storage) ─────────────────────────────
+datasets/
+
+# ── ML models (use model registry) ───────────────────────────────────────────
+*.pt
+*.bin
+*.safetensors
+models/
+
+# ── Docker overrides ──────────────────────────────────────────────────────────
+docker-compose.override.yml

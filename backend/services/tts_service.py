@@ -4,9 +4,9 @@ from typing import AsyncIterator, Callable
 
 import asyncio
 
-from ..logger import log_event
-from ..metrics import record_timing
-from ..tts_service import generate_tts, generate_tts_bytes, split_tts_chunks
+from backend.core.logger import log_event
+from backend.core.metrics import record_timing
+from backend.infrastructure.ml.tts_service import generate_tts, generate_tts_bytes, split_tts_chunks
 
 DEFAULT_TTS_RETRY_ATTEMPTS = max(1, int((os.getenv("TTS_RETRY_ATTEMPTS") or "2").strip() or "2"))
 DEFAULT_TTS_RETRY_BACKOFF_MS = max(0, int((os.getenv("TTS_RETRY_BACKOFF_MS") or "250").strip() or "250"))

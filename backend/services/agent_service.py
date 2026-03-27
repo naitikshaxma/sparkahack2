@@ -6,7 +6,7 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     OpenAI = None
 
-from ..config import get_settings
+from backend.core.config import get_settings
 from ..utils.language import normalize_language_code
 from ..utils.form_schema import get_field_question, get_next_field
 from ..utils.privacy import redact_sensitive_text, sanitize_profile_for_response

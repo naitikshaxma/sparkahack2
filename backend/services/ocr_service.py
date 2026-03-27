@@ -3,16 +3,20 @@ import time
 from typing import Any, Dict
 import asyncio
 
-import pytesseract
-from PIL import Image
+try:
+    import pytesseract  # type: ignore
+    from PIL import Image  # type: ignore
+except ImportError:  # pragma: no cover
+    pytesseract = None  # type: ignore
+    Image = None  # type: ignore
 
 try:
     from openai import OpenAI  # type: ignore
 except Exception:  # pragma: no cover - optional dependency
     OpenAI = None
 
-from ..config import get_settings
-from ..logger import log_event
+from backend.core.config import get_settings
+from backend.core.logger import log_event
 
 
 SETTINGS = get_settings()

@@ -1,4 +1,4 @@
-from backend.flow_engine import generate_response
+from backend.application.engines.flow import generate_response
 from backend.intents import INTENT_APPLY_LOAN, INTENT_GENERAL_QUERY, normalize_intent_prediction
 
 
@@ -17,9 +17,9 @@ def test_unknown_intent_is_handled_gracefully() -> None:
 
 
 def test_low_confidence_intent_falls_back_to_general_query(monkeypatch) -> None:
-    monkeypatch.setattr("backend.flow_engine.retrieve_scheme", lambda transcript, lang: None)
+    monkeypatch.setattr("backend.application.engines.flow.retrieve_scheme", lambda transcript, lang: None)
     monkeypatch.setattr(
-        "backend.flow_engine.predict_intent_detailed",
+        "backend.application.engines.flow.predict_intent_detailed",
         lambda transcript: {
             "raw_intent": INTENT_APPLY_LOAN,
             "primary_intent": INTENT_GENERAL_QUERY,

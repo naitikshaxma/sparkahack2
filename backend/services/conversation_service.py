@@ -4,11 +4,11 @@ import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from ..bert_service import predict_intent_detailed
-from ..intent_router import detect_intent_and_mode, is_followup_info_query
+from backend.infrastructure.ml.bert_service import predict_intent_detailed
+from backend.application.use_cases.intent_detector import detect_intent_and_mode, is_followup_info_query
 from ..intents import ACTION_INTENTS, INFO_INTENTS, INTENT_SCHEME_QUERY
-from ..rag_service import recommend_schemes, recommend_schemes_with_reasons, retrieve_scheme_with_recommendations
-from ..decision_engine import detect_user_need
+from backend.infrastructure.ml.rag_service import recommend_schemes, recommend_schemes_with_reasons, retrieve_scheme_with_recommendations
+from backend.application.engines.decision import detect_user_need
 from ..response_formatter import (
     build_quick_actions,
     build_recommendation_quick_actions,
@@ -16,8 +16,8 @@ from ..response_formatter import (
     format_info_text,
     format_short_voice_text,
 )
-from ..metrics import record_fallback
-from ..logger import log_event
+from backend.core.metrics import record_fallback
+from backend.core.logger import log_event
 from ..utils.language import normalize_language_code
 from ..utils.privacy import redact_sensitive_text, sanitize_profile_for_response
 from ..utils.context_fusion import adaptive_confidence_thresholds, build_context_fusion

@@ -1,12 +1,12 @@
 from typing import Any, Dict
 
-from ..bert_service import get_intent_model_status
-from ..intent_analytics import get_intent_metrics
-from ..logger import log_event
-from ..metrics import get_metrics_snapshot, get_public_metrics
-from ..rag_service import get_rag_status
+from backend.infrastructure.ml.bert_service import get_intent_model_status
+from backend.core.intent_analytics import get_intent_metrics
+from backend.core.logger import log_event
+from backend.core.metrics import get_metrics_snapshot, get_public_metrics
+from backend.infrastructure.ml.rag_service import get_rag_status
 from ..utils.session_manager import get_session_store_status
-from ..whisper_service import get_whisper_status
+from backend.infrastructure.ml.whisper_service import get_whisper_status
 
 
 class SystemService:

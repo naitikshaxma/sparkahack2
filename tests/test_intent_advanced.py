@@ -1,5 +1,5 @@
-from backend.intent_analytics import get_intent_metrics, record_intent_event
-from backend.intent_resolution import detect_multi_intents, resolve_intent_decision
+from backend.core.intent_analytics import get_intent_metrics, record_intent_event
+from backend.application.use_cases.intent_resolver import detect_multi_intents, resolve_intent_decision
 from backend.intents import INTENT_APPLY_LOAN, calibrate_confidence
 
 

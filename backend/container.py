@@ -3,7 +3,7 @@ from functools import lru_cache
 
 from fastapi import Depends
 
-from .config import Settings, get_settings
+from backend.core.config import Settings, get_settings
 from .services.conversation_service import ConversationService
 from .services.intent_service import IntentService
 from .services.ocr_service import OcrService

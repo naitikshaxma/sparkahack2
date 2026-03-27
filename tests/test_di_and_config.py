@@ -1,6 +1,6 @@
 import pytest
 
-from backend.config import Settings
+from backend.core.config import Settings
 from backend.container import get_container
 
 

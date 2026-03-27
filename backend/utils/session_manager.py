@@ -13,8 +13,8 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     redis = None
 
-from ..config import get_settings
-from ..db import db_session_scope
+from backend.core.config import get_settings
+from backend.infrastructure.database.connection import db_session_scope
 from ..models.db_models import ConversationHistory, Session as DBSession
 from ..auth import get_current_user_id
 from sqlalchemy import text

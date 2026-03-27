@@ -2,8 +2,8 @@ import time
 
 import asyncio
 
-from ..logger import log_event
-from ..whisper_service import transcribe_audio
+from backend.core.logger import log_event
+from backend.infrastructure.ml.whisper_service import transcribe_audio
 
 
 class STTService:

@@ -1,6 +1,6 @@
 import json
 
-from backend.logger import configure_logging, log_event
+from backend.core.logger import configure_logging, log_event
 
 
 def test_structured_logging_emits_json_payload(capsys) -> None:

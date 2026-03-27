@@ -1,6 +1,6 @@
 import uuid
 
-from backend.tts_service import split_tts_chunks
+from backend.services.tts_service import split_tts_chunks
 from backend.utils.language import detect_input_language
 from backend.utils.personality import apply_tone, normalize_tone
 from backend.voice_state import clear_interrupt, get_voice_state, interrupt_voice, is_interrupted, set_voice_state
