@@ -7,7 +7,8 @@ type TelemetryEvent =
   | "latency"
   | "error"
   | "quick_action"
-  | "language_detected";
+  | "language_detected"
+  | "audio_queue_trimmed";
 
 interface TelemetryPayload {
   event: TelemetryEvent;

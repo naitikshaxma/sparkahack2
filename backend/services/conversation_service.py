@@ -2,39 +2,77 @@ import re
 import logging
 import os
 import time
-from typing import Any, Dict, List, Optional, Tuple
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Dict, List, Optional, Tuple, cast
+from urllib.parse import urljoin
 
-from backend.infrastructure.ml.bert_service import predict_intent_detailed
-from backend.application.use_cases.intent_detector import detect_intent_and_mode, is_followup_info_query
 from ..intents import ACTION_INTENTS, INFO_INTENTS, INTENT_SCHEME_QUERY
-from backend.infrastructure.ml.rag_service import recommend_schemes, recommend_schemes_with_reasons, retrieve_scheme_with_recommendations
-from backend.application.engines.decision import detect_user_need
+from backend.services.rag_service import recommend_schemes, recommend_schemes_with_reasons, retrieve_scheme_with_recommendations
+from backend.domain.engines.decision import detect_user_need
 from ..response_formatter import (
     build_quick_actions,
     build_recommendation_quick_actions,
     build_scheme_details,
     format_info_text,
-    format_short_voice_text,
 )
 from backend.core.metrics import record_fallback
 from backend.core.logger import log_event
-from ..utils.language import normalize_language_code
-from ..utils.privacy import redact_sensitive_text, sanitize_profile_for_response
-from ..utils.context_fusion import adaptive_confidence_thresholds, build_context_fusion
-from ..utils.form_schema import (
+from backend.shared.language.language import normalize_language_code
+from backend.shared.security.privacy import fingerprint_text, redact_sensitive_data, redact_sensitive_text
+from backend.shared.performance.context_fusion import adaptive_confidence_thresholds, build_context_fusion
+from backend.shared.session.form_schema import (
     get_default_scheme_for_category,
     get_field_question,
     get_fields_for_scheme,
+    get_form_type_for_scheme,
     get_next_field,
     resolve_scheme_name,
     validate_field,
 )
-from ..utils.session_manager import create_session, delete_session, get_session, update_session
-from ..utils.validator import validate
+from ..infrastructure.session.session_store import create_session, delete_session, get_session, update_session
+from backend.shared.validators.validator import validate
 from ..text_normalizer import normalize_for_intent
-from ..validators.input_validator import validate_input as security_validate_input
+from backend.shared.validators.input_validator import validate_input as security_validate_input
 from .agent_service import run_agent
-from .intent_service import IntentService
+from .intent_service import IntentService, detect_intent_and_mode, is_followup_info_query
+from .helpers.response_builder import (
+    build_response_payload,
+    display_aligned_text,
+    format_response as format_response_helper,
+    merge_control_actions,
+    micro_latency_ack,
+    short_answer as short_answer_helper,
+)
+from .helpers.intent_handler import (
+    is_ambiguous_input,
+    is_correction_request,
+    is_generic_help_query,
+    is_unclear_input,
+    looks_like_field_value,
+)
+from .helpers.rag_handler import (
+    adaptive_recommendation_limit,
+    apply_recommendation_continuity,
+    recommendation_suffix,
+    smart_clarification_message,
+)
+from backend.shared.session.session_manager import (
+    APPLY_INTENTS,
+    STATE_IDLE,
+    apply_state_transition,
+    initialize_session_structure,
+)
+from backend.infrastructure.ml.scheme_registry import find_schemes_in_text, get_scheme_registry
+from backend.infrastructure.database.connection import db_session_scope
+from backend.infrastructure.database import ConversationHistory, Session as SessionModel
+from backend.core.config import get_settings
+import requests
+
+try:
+    import redis  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    redis = None
 
 
 logger = logging.getLogger(__name__)
@@ -61,8 +99,10 @@ GENERIC_HELP_PATTERNS = {
 }
 
 FIELD_LABELS = {
+    "name": {"en": "Name", "hi": "नाम"},
     "full_name": {"en": "Full Name", "hi": "पूरा नाम"},
     "phone": {"en": "Phone", "hi": "मोबाइल नंबर"},
+    "aadhaar": {"en": "Aadhaar", "hi": "आधार"},
     "aadhaar_number": {"en": "Aadhaar", "hi": "आधार नंबर"},
     "annual_income": {"en": "Annual Income", "hi": "वार्षिक आय"},
     "land_holding_acres": {"en": "Land Holding", "hi": "भूमि होल्डिंग"},
@@ -73,12 +113,17 @@ FIELD_LABELS = {
     "property_ownership": {"en": "Property Ownership", "hi": "संपत्ति स्वामित्व"},
 }
 
-SCHEME_ENTITY_RE = re.compile(r"\b(pm\s*kisan|ayushman|pmay|pension|loan)\b", re.IGNORECASE)
 NUMBER_ENTITY_RE = re.compile(r"\b\d{4,}\b")
 INTENT_SERVICE = IntentService()
 DIALOGUE_STATES = {"idle", "collecting_info", "confirming", "completed"}
 EXTRACTION_AUTO_FILL_THRESHOLD = 0.72
 MAX_INVALID_ATTEMPTS_PER_FIELD = 3
+RATE_LIMIT_WINDOW_SECONDS = 5.0
+RATE_LIMIT_MAX_REQUESTS = 5
+MAX_RESPONSE_WORDS = 300
+AUTOFILL_SERVICE_URL = (os.getenv("AUTOFILL_SERVICE_URL") or "http://127.0.0.1:8089").strip()
+AUTOFILL_HEALTH_TIMEOUT_SECONDS = 1.0
+AUTOFILL_REQUEST_TIMEOUT_SECONDS = 2.5
 CORRECTION_PATTERNS = {
     "wrong",
     "change",
@@ -90,9 +135,408 @@ CORRECTION_PATTERNS = {
     "सुधार",
 }
 
+_history_persist_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="history-persist")
+_autofill_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="autofill")
+_settings = get_settings()
+_rate_limit_redis_client = None
+MVP_PIPELINE_ENABLED = (os.getenv("MVP_PIPELINE_ENABLED") or "1").strip().lower() not in {"0", "false", "no"}
+ML_RAG_TIMEOUT_SECONDS = min(1.5, max(0.2, float((os.getenv("ML_RAG_TIMEOUT_SECONDS") or "1.5").strip() or "1.5")))
+
+
+def _simple_fallback_text(user_input: str, language: str) -> Tuple[str, str]:
+    lowered = str(user_input or "").lower()
+    if "kisan" in lowered or "किसान" in str(user_input or ""):
+        if language == "hi":
+            return (
+                "आपकी query किसान-related योजना से जुड़ सकती है। कृपया scheme का सटीक नाम या और विवरण बताएं।",
+                "",
+            )
+        return (
+            "Your query may relate to a farmer-focused scheme. Please share the exact scheme name or more details.",
+            "",
+        )
+    if language == "hi":
+        return (
+            "मैं आपकी मदद के लिए तैयार हूँ। कृपया योजना का नाम या अपनी जरूरत बताएं, जैसे PM Kisan या आयुष्मान।",
+            "",
+        )
+    return (
+        "I am ready to help. Please share a scheme name or your need, like PM Kisan or Ayushman.",
+        "",
+    )
+
+
+def _run_intent_with_timeout(cleaned_input: str) -> Dict[str, Any]:
+    coroutine = INTENT_SERVICE.detect_async(cleaned_input, debug=False, timings={})
+    return asyncio.run(asyncio.wait_for(coroutine, timeout=ML_RAG_TIMEOUT_SECONDS))
+
+
+def _run_rag_with_timeout(cleaned_input: str, language: str, scheme_hint: str) -> Tuple[Optional[Dict[str, Any]], List[str], bool]:
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            retrieve_scheme_with_recommendations,
+            cleaned_input,
+            language,
+            3,
+            None,
+            None,
+            {"scheme_name": scheme_hint} if scheme_hint else None,
+            None,
+            None,
+        )
+        return future.result(timeout=ML_RAG_TIMEOUT_SECONDS)
+
+
+def _get_rate_limit_redis_client():
+    global _rate_limit_redis_client
+    if _rate_limit_redis_client is not None:
+        return _rate_limit_redis_client
+    if redis is None:
+        return None
+    try:
+        client = redis.Redis.from_url(_settings.redis_url, decode_responses=True)
+        client.ping()
+        _rate_limit_redis_client = client
+        return _rate_limit_redis_client
+    except Exception:
+        return None
+
+
+def _rate_limit_subject(session_id: str, session: Optional[Dict[str, Any]]) -> str:
+    user_id = str((session or {}).get("user_id") or "").strip()
+    if user_id:
+        return f"user:{user_id}"
+    return f"anon:{session_id}"
+
+
+def _is_rate_limited(rate_key: str) -> bool:
+    client = _get_rate_limit_redis_client()
+    if client is None:
+        return False
+    redis_key = f"rate_limit:{rate_key}"
+    try:
+        raw_count = cast(Any, client.incr(redis_key))
+        request_count = int(raw_count if isinstance(raw_count, int) else (raw_count or 0))
+        if request_count == 1:
+            client.expire(redis_key, int(RATE_LIMIT_WINDOW_SECONDS))
+        return request_count > RATE_LIMIT_MAX_REQUESTS
+    except Exception:
+        return False
+
+
+def _summarize_to_max_words(text: str, max_words: int = MAX_RESPONSE_WORDS) -> str:
+    content = str(text or "").strip()
+    if not content:
+        return ""
+    words = content.split()
+    if len(words) <= max_words:
+        return content
+    trimmed = " ".join(words[:max_words]).rstrip(" ,.;:")
+    return f"{trimmed}..."
+
+
+def _autofill_fallback_message(language: str) -> str:
+    if language == "hi":
+        return "Aapka form ready hai. Kripya review karke submit karein."
+    return "Your form is ready. Please review and submit."
+
+
+def _is_autofill_command(user_input: str) -> bool:
+    text = str(user_input or "").strip().lower()
+    return text in {"auto fill form", "autofill", "auto-fill"}
+
+
+def _autofill_health_ok() -> bool:
+    health_url = urljoin(AUTOFILL_SERVICE_URL.rstrip("/") + "/", "health")
+    try:
+        response = requests.get(health_url, timeout=AUTOFILL_HEALTH_TIMEOUT_SECONDS)
+        return response.status_code == 200
+    except Exception:
+        return False
+
+
+def _call_autofill_service(session: Dict[str, Any]) -> Dict[str, Any]:
+    autofill_url = urljoin(AUTOFILL_SERVICE_URL.rstrip("/") + "/", "autofill")
+    payload = {
+        "session": session,
+    }
+    response = requests.post(autofill_url, json=payload, timeout=AUTOFILL_REQUEST_TIMEOUT_SECONDS)
+    if response.status_code >= 400:
+        raise RuntimeError(f"autofill_http_{response.status_code}")
+    data = response.json() if response.content else {}
+    if isinstance(data, dict):
+        return data
+    return {}
+
+
+def _run_autofill_with_timeout(session: Dict[str, Any], language: str) -> Dict[str, str]:
+    if not _autofill_health_ok():
+        return {
+            "status": "failed",
+            "message": _autofill_fallback_message(language),
+        }
+
+    future = _autofill_executor.submit(_call_autofill_service, dict(session or {}))
+    try:
+        result = future.result(timeout=AUTOFILL_REQUEST_TIMEOUT_SECONDS + 0.2)
+        service_status = str((result or {}).get("status") or "").strip().lower()
+        if service_status == "success":
+            if language == "hi":
+                return {
+                    "status": "success",
+                    "message": "Auto-fill complete. Kripya review karke submit karein.",
+                }
+            return {
+                "status": "success",
+                "message": "Auto-fill complete. Please review and submit.",
+            }
+        return {
+            "status": "failed",
+            "message": _autofill_fallback_message(language),
+        }
+    except Exception:
+        return {
+            "status": "failed",
+            "message": _autofill_fallback_message(language),
+        }
+
+
+def _apply_response_length_control(payload: Dict[str, Any], max_words: int = MAX_RESPONSE_WORDS) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        return payload
+    for key in ("response_text", "voice_text", "confirmation", "explanation", "next_step"):
+        if isinstance(payload.get(key), str):
+            payload[key] = _summarize_to_max_words(payload[key], max_words=max_words)
+    return payload
+
+
+def _build_rate_limit_response(session_id: str, language: str, session: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    text = "Please wait a moment before sending more requests." if language != "hi" else "कृपया थोड़ी देर रुककर फिर से अनुरोध भेजें।"
+    return _build_response(
+        session_id=session_id,
+        response_text=text,
+        field_name=None,
+        validation_passed=True,
+        validation_error=None,
+        session_complete=False,
+        mode="clarify",
+        action="rate_limited",
+        session=session,
+        quick_actions=[],
+        voice_text=text,
+    )
+
+
+def _persist_user_history(
+    *,
+    session_id: str,
+    user_id: int,
+    query_text: str,
+    response_text: str,
+    detected_scheme: str,
+    intent: str,
+) -> None:
+    try:
+        safe_query = redact_sensitive_data(query_text)
+        safe_response = redact_sensitive_data(response_text)
+        with db_session_scope() as db:
+            existing_session = db.get(SessionModel, str(session_id or "")[:128])
+            if existing_session is None:
+                db.add(
+                    SessionModel(
+                        session_id=str(session_id or "")[:128],
+                        user_id=user_id,
+                        state_json={},
+                    )
+                )
+                db.flush()
+
+            db.add(
+                ConversationHistory(
+                    session_id=str(session_id or "")[:128],
+                    user_id=user_id,
+                    query=safe_query[:4000],
+                    response=safe_response[:8000],
+                    detected_scheme=detected_scheme[:255] if detected_scheme else None,
+                    intent=intent[:128] if intent else None,
+                    role="assistant",
+                    message=safe_response[:4000],
+                )
+            )
+    except Exception as exc:
+        log_event(
+            "conversation_history_persist_failure",
+            level="warning",
+            endpoint="conversation_service",
+            status="failure",
+            session_id=str(session_id or ""),
+            user_id=str(user_id),
+            error_type=type(exc).__name__,
+            error_message=str(exc),
+        )
+
+
+def _persist_user_history_async(session_id: str, session: Dict[str, Any], user_input: str, result: Dict[str, Any]) -> None:
+    user_id_raw = str(session.get("user_id") or "").strip()
+    if not user_id_raw.isdigit():
+        return
+
+    scheme_detection = result.get("scheme_detection") or (result.get("debug") or {}).get("scheme_detection") or {}
+    selected_scheme = str(
+        scheme_detection.get("selected_scheme")
+        or session.get("selected_scheme")
+        or session.get("last_scheme")
+        or ""
+    ).strip()
+    intent = str(result.get("primary_intent") or "").strip()
+    response_text = str(result.get("response_text") or result.get("voice_text") or "").strip()
+    query_text = str(user_input or "").strip()
+    if not query_text and not response_text:
+        return
+
+    _persist_user_history(
+        session_id=session_id,
+        user_id=int(user_id_raw),
+        query_text=query_text,
+        response_text=response_text,
+        detected_scheme=selected_scheme,
+        intent=intent,
+    )
+
+
+def _normalize_history_user_id(session: Dict[str, Any]) -> Optional[int]:
+    user_id_raw = str(session.get("user_id") or "").strip()
+    if not user_id_raw.isdigit():
+        return None
+    return int(user_id_raw)
+
+
+def _extract_category_from_scheme_name(scheme_name: str) -> str:
+    text = str(scheme_name or "").strip().lower()
+    if not text:
+        return "general"
+
+    category_keywords = {
+        "agriculture": {"kisan", "krishi", "farmer", "crop", "agri"},
+        "housing": {"housing", "house", "home", "awas", "rental"},
+        "health": {"health", "bima", "insurance", "medical", "ayush", "care"},
+        "education": {"student", "scholarship", "education", "vidya", "school"},
+        "employment": {"employment", "job", "skill", "startup", "business", "self"},
+        "finance": {"loan", "credit", "finance", "pension", "savings"},
+    }
+
+    for category, keywords in category_keywords.items():
+        if any(keyword in text for keyword in keywords):
+            return category
+    return "general"
+
+
+def _fetch_user_history_context(session: Dict[str, Any]) -> Dict[str, Any]:
+    user_id = _normalize_history_user_id(session)
+    if user_id is None:
+        return {"last_scheme": "", "top_category": "", "recent_schemes": []}
+
+    with db_session_scope() as db:
+        rows = (
+            db.query(ConversationHistory)
+            .filter(ConversationHistory.user_id == user_id)
+            .order_by(ConversationHistory.timestamp.desc())
+            .limit(30)
+            .all()
+        )
+
+    if not rows:
+        return {"last_scheme": "", "top_category": "", "recent_schemes": []}
+
+    recent_schemes: List[str] = []
+    category_counts: Dict[str, int] = {}
+    last_scheme = ""
+
+    for row in rows:
+        scheme = str(getattr(row, "detected_scheme", "") or "").strip()
+        if not scheme:
+            continue
+        if not last_scheme:
+            last_scheme = scheme
+        if scheme not in recent_schemes:
+            recent_schemes.append(scheme)
+        category = _extract_category_from_scheme_name(scheme)
+        category_counts[category] = int(category_counts.get(category, 0)) + 1
+
+    top_category = ""
+    if category_counts:
+        top_category = max(category_counts.items(), key=lambda item: item[1])[0]
+
+    return {
+        "last_scheme": last_scheme,
+        "top_category": top_category,
+        "recent_schemes": recent_schemes[:5],
+    }
+
+
+def _has_explicit_scheme_reference(user_input: str) -> bool:
+    matches = _detect_scheme_mentions(user_input, limit=3)
+    return any(float(item.get("score") or 0.0) >= 0.72 for item in matches)
+
+
+def _is_vague_scheme_reference(user_input: str) -> bool:
+    return is_vague_reference(user_input)
+
+
+def is_vague_reference(text: str) -> bool:
+    text = str(text or "").strip().lower()
+    if not text:
+        return False
+    vague_markers = {
+        "uska",
+        "uske",
+        "uski",
+        "that",
+        "that scheme",
+        "that one",
+        "same scheme",
+        "woh",
+        "wo",
+        "wo scheme",
+        "woh scheme",
+        "us wali",
+    }
+    return text in vague_markers or any(marker in text for marker in vague_markers)
+
+
+def _is_context_info_followup(text: str) -> bool:
+    query = str(text or "").strip().lower()
+    if not query:
+        return False
+    tokens = {
+        "eligibility",
+        "eligible",
+        "documents",
+        "document",
+        "benefits",
+        "benefit",
+        "process",
+        "apply process",
+        "पात्र",
+        "पात्रता",
+        "दस्तावेज",
+        "लाभ",
+    }
+    return any(token in query for token in tokens)
+
+
+def _build_returning_user_prompt(language: str, scheme_name: str) -> str:
+    scheme = str(scheme_name or "").strip()
+    if language == "hi":
+        return f"पिछली बार आपने {scheme} के बारे में पूछा था। क्या वहीं से जारी रखें?"
+    return f"Last time you asked about {scheme}. Continue?"
+
 
 def _session_fields(session: Dict[str, Any]) -> List[str]:
-    return get_fields_for_scheme(session.get("selected_scheme"))
+    selected_scheme = session.get("selected_scheme")
+    if get_form_type_for_scheme(selected_scheme) == "generic" and bool(session.get("_force_minimal_generic_fields", False)):
+        return ["full_name", "phone", "aadhaar_number"]
+    return get_fields_for_scheme(selected_scheme)
 
 
 def _detect_user_type(text: str) -> Optional[str]:
@@ -134,6 +578,10 @@ def _update_user_need_profile(session: Dict[str, Any], user_input: str, need_cat
     profile.setdefault("need_category", None)
     session["user_need_profile"] = profile
     return profile
+
+
+def _sanitize_user_profile_for_rag(profile: Dict[str, Optional[str]]) -> Dict[str, str]:
+    return {key: value for key, value in profile.items() if isinstance(value, str) and value.strip()}
 
 
 def _session_feedback(session: Dict[str, Any]) -> Dict[str, object]:
@@ -231,12 +679,203 @@ def _append_history(session: Dict[str, Any], role: str, content: str) -> None:
     _trim_history(session)
 
 
+def _detect_scheme_mentions(text: str, limit: int = 5) -> List[Dict[str, Any]]:
+    forced = _forced_scheme_from_query(text)
+    if forced:
+        return [{"scheme": forced, "score": 1.0}]
+    return find_schemes_in_text(text, limit=limit)
+
+
+def _extract_explicit_scheme_phrase(text: str) -> str:
+    source = str(text or "").strip()
+    if not source:
+        return ""
+    lowered = source.lower()
+    patterns = (
+        r"(?:apply\s+for|application\s+for|enroll\s+for)\s+([a-z0-9][a-z0-9\s\-]{2,80})",
+        r"(?:for)\s+([a-z0-9][a-z0-9\s\-]{2,80})\s+(?:scheme|yojana)\b",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, lowered)
+        if not match:
+            continue
+        phrase = re.sub(r"\b(scheme|yojana)\b", "", match.group(1)).strip(" .,!?:;-\t")
+        phrase = re.sub(r"\s+", " ", phrase)
+        if len(phrase) >= 3:
+            return phrase
+    return ""
+
+
+def _prefer_explicit_scheme_match(text: str, candidates: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    query = str(text or "").strip().lower()
+    if not query or not candidates:
+        return None
+
+    for item in candidates:
+        scheme = str(item.get("scheme") or "").strip().lower()
+        if scheme and scheme in query:
+            return item
+
+    explicit_phrase = _extract_explicit_scheme_phrase(query)
+    if explicit_phrase:
+        for item in candidates:
+            scheme = str(item.get("scheme") or "").strip().lower()
+            if not scheme:
+                continue
+            if explicit_phrase in scheme or scheme in explicit_phrase:
+                return item
+    return None
+
+
+def _has_scheme_signal(text: str) -> bool:
+    query = str(text or "").strip().lower()
+    if not query:
+        return False
+
+    generic_tokens = {"scheme", "yojana", "apply", "eligibility", "eligible", "application"}
+    if any(token in query for token in generic_tokens):
+        return True
+
+    return bool(_detect_scheme_mentions(query, limit=1))
+
+
+def _is_broad_discovery_request(text: str) -> bool:
+    query = str(text or "").strip().lower()
+    if not query:
+        return False
+    markers = {
+        "scheme",
+        "yojana",
+        "for family",
+        "family",
+        "kisan",
+        "farmer",
+        "batao",
+        "suggest",
+        "recommend",
+    }
+    return any(marker in query for marker in markers)
+
+
+def _forced_scheme_from_query(text: str) -> str:
+    return ""
+
+
+def _fast_scheme_info_response(query: str, language: str, scheme_name: str) -> Dict[str, str]:
+    normalized_query = str(query or "").strip().lower()
+    lang = normalize_language_code(language, default="en")
+
+    asks_process = any(token in normalized_query for token in {"kaise", "kya karna", "banega", "milega", "apply", "process", "application"})
+    asks_documents = any(token in normalized_query for token in {"document", "documents", "dastavez", "kya chahiye", "required"})
+    asks_benefits = any(token in normalized_query for token in {"kitna", "benefit", "benefits", "amount", "paisa"})
+
+    if asks_documents:
+        if lang == "hi":
+            explanation = f"{scheme_name} के लिए आमतौर पर आधार, पता प्रमाण और आय संबंधी दस्तावेज़ चाहिए होते हैं।"
+            next_step = "अगर चाहें तो मैं आवेदन के step-by-step process भी बताऊँ।"
+        else:
+            explanation = f"For {scheme_name}, you usually need Aadhaar, address proof, and income-related documents."
+            next_step = "I can also share the step-by-step application process."
+    elif asks_benefits:
+        if lang == "hi":
+            explanation = f"{scheme_name} के लाभ राज्य और पात्रता पर निर्भर करते हैं, लेकिन यह योजना आर्थिक/सेवा सहायता प्रदान करती है।"
+            next_step = "अगर चाहें तो मैं eligibility और apply process भी बता दूँ।"
+        else:
+            explanation = f"Benefits under {scheme_name} depend on state rules and eligibility, but the scheme provides meaningful support."
+            next_step = "I can also share eligibility and the apply process."
+    elif asks_process:
+        if lang == "hi":
+            explanation = (
+                f"{scheme_name} के लिए process: 1. eligibility check करें। "
+                "2. required documents तैयार करें। 3. portal या CSC से apply/register करें।"
+            )
+            next_step = "अगर चाहें तो मैं documents की छोटी checklist भी दे सकता हूँ।"
+        else:
+            explanation = (
+                f"Process for {scheme_name}: 1. Check eligibility. "
+                "2. Keep required documents ready. 3. Apply/register on the portal or via CSC."
+            )
+            next_step = "I can also share a short documents checklist."
+    else:
+        if lang == "hi":
+            explanation = f"{scheme_name} एक सरकारी योजना है जो पात्र नागरिकों को लाभ और सहायता प्रदान करती है।"
+            next_step = "आप eligibility, documents, benefits या application process पूछ सकते हैं।"
+        else:
+            explanation = f"{scheme_name} is a government scheme that offers benefits and support to eligible citizens."
+            next_step = "You can ask about eligibility, documents, benefits, or the application process."
+
+    return {
+        "confirmation": scheme_name,
+        "explanation": explanation,
+        "next_step": next_step,
+    }
+
+
+def _resolve_apply_target_scheme(
+    session: Dict[str, Any],
+    cleaned_input: str,
+    mentioned_schemes: List[Dict[str, Any]],
+    category_hint: Optional[str] = None,
+) -> str:
+    forced_scheme = _forced_scheme_from_query(cleaned_input)
+    if forced_scheme:
+        return resolve_scheme_name(forced_scheme)
+
+    explicit_match = _prefer_explicit_scheme_match(cleaned_input, mentioned_schemes)
+    if explicit_match and str(explicit_match.get("scheme") or "").strip():
+        return resolve_scheme_name(explicit_match.get("scheme"))
+
+    explicit_phrase = _extract_explicit_scheme_phrase(cleaned_input)
+    if explicit_phrase:
+        return resolve_scheme_name(explicit_phrase)
+
+    if mentioned_schemes:
+        top_candidate = max(mentioned_schemes, key=lambda item: float(item.get("score") or 0.0))
+        if str(top_candidate.get("scheme") or "").strip():
+            return resolve_scheme_name(top_candidate.get("scheme"))
+
+    selected_default = resolve_scheme_name(get_default_scheme_for_category("general"))
+    existing = resolve_scheme_name(session.get("selected_scheme") or session.get("current_scheme") or session.get("last_scheme"))
+    if existing and existing != selected_default:
+        return existing
+
+    return resolve_scheme_name(get_default_scheme_for_category(category_hint))
+
+
+def _scheme_detection_debug(session: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    registry = get_scheme_registry()
+    context = session or {}
+    selected = str(
+        context.get("selected_scheme")
+        or context.get("current_scheme")
+        or context.get("last_scheme")
+        or ""
+    ).strip()
+    return {
+        "input": str(context.get("_scheme_detection_input") or ""),
+        "candidates": list(context.get("_scheme_detection_candidates") or []),
+        "selected_scheme": selected,
+        "decision": str(context.get("_scheme_detection_decision") or "none"),
+        "total_available": int(registry.get("total", 0)),
+    }
+
+
+def _safety_debug(session: Optional[Dict[str, Any]]) -> Dict[str, bool]:
+    context = session or {}
+    return {
+        "low_confidence": bool(context.get("_safety_low_confidence", False)),
+        "ambiguous": bool(context.get("_safety_ambiguous", False)),
+        "fallback_triggered": bool(context.get("_safety_fallback_triggered", False)),
+    }
+
+
 def _extract_entities(text: str) -> Dict[str, List[str]]:
     content = (text or "").strip()
     if not content:
         return {"schemes": [], "numbers": []}
 
-    schemes = [match.group(1).strip().lower() for match in SCHEME_ENTITY_RE.finditer(content)]
+    candidates = _detect_scheme_mentions(content, limit=5)
+    schemes = [str(item.get("scheme") or "").lower() for item in candidates if str(item.get("scheme") or "").strip()]
     numbers = [match.group(0) for match in NUMBER_ENTITY_RE.finditer(content)]
     return {
         "schemes": sorted(set(schemes))[:5],
@@ -281,81 +920,51 @@ def _build_response(
     voice_text: Optional[str] = None,
     quick_actions: Optional[List[Dict[str, str]]] = None,
     recommended_schemes: Optional[List[str]] = None,
+    autofill_status: Optional[str] = None,
 ) -> Dict[str, Any]:
-    steps_done = 0
-    active_fields = _session_fields(session or {}) if session else get_fields_for_scheme(None)
-    steps_total = len(active_fields)
-    if session:
-        completion = session.get("field_completion", {})
-        steps_done = sum(1 for field in active_fields if completion.get(field))
+    form_type = "generic"
+    if isinstance(session, dict):
+        form_type = get_form_type_for_scheme(session.get("selected_scheme") or session.get("last_scheme"))
 
-    language = normalize_language_code((session or {}).get("language", "en") if session else "en", default="en")
-    completed_fields = []
-    if session:
-        completion = session.get("field_completion", {})
-        for field in active_fields:
-            if completion.get(field):
-                completed_fields.append(FIELD_LABELS.get(field, {}).get(language, field))
-
-    natural_response = format_response(response_text, language)
-    natural_voice = format_response(voice_text or natural_response, language)
-    synced_display = _display_aligned_text(natural_response, language)
-    base_quick_actions = list(quick_actions or [])
-    merged_actions = _merge_control_actions(language, base_quick_actions)
-
-    return {
-        "session_id": session_id,
-        "response_text": synced_display,
-        "voice_text": natural_voice or format_short_voice_text(natural_response, language),
-        "instant_ack": _micro_latency_ack(language),
-        "primary_intent": (session or {}).get("last_intent"),
-        "secondary_intents": (session or {}).get("last_secondary_intents", []),
-        "field_name": field_name,
-        "validation_passed": validation_passed,
-        "validation_error": validation_error,
-        "session_complete": session_complete,
-        "mode": mode,
-        "action": action,
-        "steps_done": steps_done,
-        "steps_total": steps_total,
-        "completed_fields": completed_fields,
-        "scheme_details": scheme_details,
-        "quick_actions": merged_actions,
-        "recommended_schemes": recommended_schemes or [],
-        "user_profile": sanitize_profile_for_response((session or {}).get("user_profile", {})),
-        "intent_debug": (session or {}).get("_intent_debug"),
-    }
+    payload = build_response_payload(
+        session_id=session_id,
+        response_text=response_text,
+        field_name=field_name,
+        validation_passed=validation_passed,
+        session_complete=session_complete,
+        validation_error=validation_error,
+        mode=mode,
+        action=action,
+        session=session,
+        scheme_details=scheme_details,
+        voice_text=voice_text,
+        quick_actions=quick_actions,
+        recommended_schemes=recommended_schemes,
+        field_labels=FIELD_LABELS,
+        session_fields=_session_fields(session or {}) if session else [],
+    )
+    scheme_debug = _scheme_detection_debug(session)
+    safety_debug = _safety_debug(session)
+    payload["scheme_detection"] = scheme_debug
+    payload["safety"] = safety_debug
+    payload["form_type"] = form_type
+    payload["apply_flow_forced"] = bool((session or {}).get("_apply_flow_forced", False))
+    payload["confirmation_handled"] = bool((session or {}).get("_confirmation_handled", False))
+    payload["context_applied"] = bool((session or {}).get("_context_applied", False))
+    payload["autofill_status"] = str(autofill_status) if autofill_status is not None else None
+    debug_payload = payload.setdefault("debug", {})
+    debug_payload["scheme_detection"] = scheme_debug
+    debug_payload["safety"] = safety_debug
+    debug_payload["form_type"] = form_type
+    debug_payload["apply_flow_forced"] = bool((session or {}).get("_apply_flow_forced", False))
+    debug_payload["confirmation_handled"] = bool((session or {}).get("_confirmation_handled", False))
+    debug_payload["context_applied"] = bool((session or {}).get("_context_applied", False))
+    debug_payload["autofill_status"] = str(autofill_status) if autofill_status is not None else None
+    return payload
 
 
 def format_response(text: str, language: str) -> str:
-    content = str(text or "").strip()
-    if not content:
-        return content
-
-    if language == "hi":
-        replacements = {
-            "कृपया बताएं": "बताइए",
-            "कृपया": "ज़रा",
-            "क्या आप": "आप",
-            "मैं आपकी मदद कर सकता हूँ": "मैं आपकी पूरी मदद करूँगा",
-            "क्या यह सही है": "ये ठीक है ना",
-        }
-        for source, target in replacements.items():
-            content = content.replace(source, target)
-    else:
-        replacements = {
-            "Please provide": "Share",
-            "Please tell me": "Tell me",
-            "I can help with this.": "I can help with that.",
-            "Do you want": "Would you like",
-        }
-        for source, target in replacements.items():
-            content = content.replace(source, target)
-
-    # Smooth punctuation keeps replies sounding less robotic.
-    content = re.sub(r"\s+", " ", content).strip()
-    content = content.replace("..", ".")
-    return content
+    return format_response_helper(text, language)
 
 
 def _normalize_mixed_input_text(user_input: str) -> str:
@@ -388,34 +997,11 @@ def _is_negative(user_input: str) -> bool:
 
 
 def _micro_latency_ack(language: str) -> str:
-    return "ठीक है, एक पल..." if language == "hi" else "Got it, just a moment..."
+    return micro_latency_ack(language)
 
 
 def _merge_control_actions(language: str, quick_actions: List[Dict[str, str]]) -> List[Dict[str, str]]:
-    controls = [
-        {
-            "label": "जारी रखें" if language == "hi" else "Continue",
-            "value": "continue_flow",
-        },
-        {
-            "label": "सुझाव बदलें" if language == "hi" else "Refine",
-            "value": "refine_suggestions",
-        },
-        {
-            "label": "अभी आवेदन करें" if language == "hi" else "Apply",
-            "value": "apply_now_direct",
-        },
-    ]
-    seen = set()
-    merged: List[Dict[str, str]] = []
-    for action in [*quick_actions, *controls]:
-        value = str(action.get("value") or "").strip()
-        label = str(action.get("label") or "").strip()
-        if not value or not label or value in seen:
-            continue
-        seen.add(value)
-        merged.append({"label": label, "value": value})
-    return merged
+    return merge_control_actions(language, quick_actions)
 
 
 def _is_short_query(text: str) -> bool:
@@ -424,19 +1010,11 @@ def _is_short_query(text: str) -> bool:
 
 
 def _display_aligned_text(text: str, language: str) -> str:
-    words = [token for token in (text or "").replace("\n", " ").split() if token]
-    if len(words) <= 34:
-        return text
-    lead = " ".join(words[:30]).rstrip(".,;: ")
-    return f"{lead}..." if language == "en" else f"{lead}..."
+    return display_aligned_text(text, language)
 
 
 def _short_answer(text: str, language: str) -> str:
-    words = [token for token in (text or "").replace("\n", " ").split() if token]
-    if len(words) <= 18:
-        return text
-    concise = " ".join(words[:16]).rstrip(".,;: ")
-    return f"{concise}..." if language == "en" else f"{concise}..."
+    return short_answer_helper(text, language)
 
 
 def _recommendation_confirmation_prompt(language: str) -> str:
@@ -539,7 +1117,10 @@ def _resolve_quick_action_input(user_input: str, language: str, session: Dict[st
 def _reset_session_state(session: Dict[str, Any]) -> Dict[str, Any]:
     # Kept for compatibility, but hard reset now uses delete + create.
     selected_scheme = resolve_scheme_name(session.get("selected_scheme") or session.get("last_scheme"))
-    dynamic_fields = get_fields_for_scheme(selected_scheme)
+    if get_form_type_for_scheme(selected_scheme) == "generic" and bool(session.get("_force_minimal_generic_fields", False)):
+        dynamic_fields = ["full_name", "phone", "aadhaar_number"]
+    else:
+        dynamic_fields = get_fields_for_scheme(selected_scheme)
     field_completion = {field: False for field in dynamic_fields}
     session["selected_scheme"] = selected_scheme
     session["user_profile"] = {}
@@ -557,7 +1138,10 @@ def _normalize_session_state(session: Dict[str, Any]) -> Dict[str, Any]:
     # Protect against corrupted or partially missing session payloads.
     selected_scheme = resolve_scheme_name(session.get("selected_scheme") or session.get("last_scheme"))
     session["selected_scheme"] = selected_scheme
-    dynamic_fields = get_fields_for_scheme(selected_scheme)
+    if get_form_type_for_scheme(selected_scheme) == "generic" and bool(session.get("_force_minimal_generic_fields", False)):
+        dynamic_fields = ["full_name", "phone", "aadhaar_number"]
+    else:
+        dynamic_fields = get_fields_for_scheme(selected_scheme)
 
     session.setdefault("user_profile", {})
     session.setdefault("field_completion", {field: False for field in dynamic_fields})
@@ -596,7 +1180,28 @@ def _normalize_session_state(session: Dict[str, Any]) -> Dict[str, Any]:
     if next_field is None and not session.get("session_complete", False):
         next_field = get_next_field(session)
     session["next_field"] = next_field
+    initialize_session_structure(session)
     return session
+
+
+def _sync_state_machine_fields_to_profile(session: Dict[str, Any]) -> None:
+    collected = dict(session.get("collected_fields") or {})
+    if not collected:
+        return
+
+    mapping = {
+        "name": "full_name",
+        "phone": "phone",
+        "aadhaar": "aadhaar_number",
+    }
+    profile = session.setdefault("user_profile", {})
+    completion = session.setdefault("field_completion", {})
+    for key, value in collected.items():
+        target = mapping.get(key)
+        if not target or not value:
+            continue
+        profile[target] = str(value)
+        completion[target] = True
 
 
 def _update_dialogue_state(session: Dict[str, Any]) -> str:
@@ -621,10 +1226,7 @@ def _update_dialogue_state(session: Dict[str, Any]) -> str:
 
 
 def _is_correction_request(user_input: str) -> bool:
-    text = (user_input or "").strip().lower()
-    if not text:
-        return False
-    return any(marker in text for marker in CORRECTION_PATTERNS)
+    return is_correction_request(user_input)
 
 
 def _unique_candidates(candidates: List[Tuple[str, float]]) -> List[Dict[str, Any]]:
@@ -656,11 +1258,72 @@ def _extract_multi_field_values(text: str) -> Dict[str, List[Dict[str, Any]]]:
     if incomes:
         extracted["annual_income"] = _unique_candidates([(value.replace(",", ""), 0.86) for value in incomes])
 
-    name_match = re.search(r"(?:my name is|i am|name[:\s]|मेरा नाम|नाम)\s*[:\-]?\s*([A-Za-z\u0900-\u097F\s.'-]{2,80})", content, re.IGNORECASE)
+    name_match = re.search(r"(?:my name is|i am|mera naam|name[:\s]|मेरा नाम|नाम)\s*[:\-]?\s*([A-Za-z\u0900-\u097F\s.'-]{2,80})", content, re.IGNORECASE)
     if name_match:
         extracted["full_name"] = _unique_candidates([(name_match.group(1).strip(), 0.84)])
 
     return extracted
+
+
+def detect_information_input(user_input: str) -> bool:
+    text = str(user_input or "").strip()
+    if not text:
+        return False
+
+    lowered = text.lower()
+    if re.fullmatch(r"\d{10}|\d{12}", re.sub(r"\D", "", text)):
+        return True
+
+    info_keywords = (
+        "aadhaar",
+        "aadhar",
+        "phone",
+        "mobile",
+        "my name",
+        "name is",
+        "income",
+        "salary",
+        "मेरा नाम",
+        "आधार",
+        "मोबाइल",
+        "फोन",
+        "आय",
+    )
+    if any(token in lowered for token in info_keywords):
+        return True
+
+    extracted = _extract_multi_field_values(text)
+    return bool(extracted)
+
+
+def _apply_info_detection_to_profile(session: Dict[str, Any], user_input: str, language: str) -> None:
+    extracted = _extract_multi_field_values(user_input)
+    if not extracted:
+        return
+
+    profile = session.setdefault("user_profile", {})
+    completion = session.setdefault("field_completion", {})
+    active_fields = set(_session_fields(session))
+
+    for field, candidates in extracted.items():
+        if field not in active_fields:
+            continue
+        values = [str(item.get("value") or "").strip() for item in candidates if str(item.get("value") or "").strip()]
+        if not values:
+            continue
+        candidate = values[0]
+        validated = validate_field(field, candidate, language=language)
+        if not validated.get("valid"):
+            continue
+        profile[field] = str(validated.get("normalized") or "")
+        completion[field] = True
+
+    next_field = get_next_field(session)
+    session["next_field"] = next_field
+    if next_field is None:
+        session["dialogue_state"] = "confirming"
+    else:
+        session["dialogue_state"] = "collecting_info"
 
 
 def _apply_extracted_fields(session: Dict[str, Any], extracted: Dict[str, List[Dict[str, Any]]], language: str) -> Dict[str, Any]:
@@ -836,101 +1499,55 @@ def _handle_ocr_confirmation(session_id: str, session: Dict[str, Any], user_inpu
 
 
 def _is_ambiguous_input(user_input: str) -> bool:
-    text = (user_input or "").strip().lower()
-    return any(word in text for word in AMBIGUOUS_WORDS)
+    return is_ambiguous_input(user_input)
 
 
 def _is_unclear_input(user_input: str) -> bool:
-    text = (user_input or "").strip().lower()
-    if len(text) <= 2:
-        return True
-    return text in UNCLEAR_WORDS
+    return is_unclear_input(user_input)
 
 
 def _is_generic_help_query(user_input: str) -> bool:
+    return is_generic_help_query(user_input)
+
+
+def _is_apply_intent_signal(user_input: str) -> bool:
     text = (user_input or "").strip().lower()
     if not text:
         return False
-    if len(text.split()) <= 2 and text in {"loan", "scheme", "help", "yojana", "madad"}:
-        return True
-    if text in GENERIC_HELP_PATTERNS:
-        return True
-    return any(pattern in text for pattern in GENERIC_HELP_PATTERNS)
+    markers = {
+        "apply",
+        "application",
+        "apply scheme",
+        "start application",
+        "start form",
+        "fill form",
+        "enroll",
+        "registration",
+        "register",
+        "start_application",
+        "apply_now",
+    }
+    return any(marker in text for marker in markers)
 
 
 def _recommendation_suffix(language: str, recommendations: List[str]) -> str:
-    if not recommendations:
-        return ""
-    if language == "hi":
-        return f"\n\nआप इन योजनाओं के बारे में पूछ सकते हैं: {', '.join(recommendations)}"
-    return f"\n\nYou can ask about these schemes: {', '.join(recommendations)}"
-
-
-def _guided_followup_question(user_input: str, language: str) -> str:
-    query = (user_input or "").strip().lower()
-    if any(token in query for token in {"loan", "credit", "finance", "financial", "लोन", "ऋण"}):
-        if language == "hi":
-            return "आपको किस तरह का लोन चाहिए: किसान, छात्र, या छोटे बिज़नेस के लिए?"
-        return "Which type of loan do you need: farmer, student, or small business?"
-    if any(token in query for token in {"health", "hospital", "medical", "स्वास्थ्य", "इलाज"}):
-        if language == "hi":
-            return "क्या मदद अस्पताल खर्च, बीमा, या परिवार कवरेज के लिए चाहिए?"
-        return "Do you need help with hospital costs, insurance, or family coverage?"
-    if any(token in query for token in {"house", "home", "housing", "घर", "आवास"}):
-        if language == "hi":
-            return "आपका फोकस घर खरीदना है, घर बनाना है, या किराए से राहत चाहिए?"
-        return "Is your focus buying a house, building one, or rental support?"
-    return (
-        "मैं सही योजना चुनने के लिए एक बात जानना चाहूँगा: आपको तुरंत किस चीज़ में मदद चाहिए?"
-        if language == "hi"
-        else "To pick the best scheme, what is your top priority right now?"
-    )
+    return recommendation_suffix(language, recommendations)
 
 
 def _smart_clarification_message(language: str, recommendations: List[str], user_input: str = "") -> str:
-    base = _guided_followup_question(user_input, language)
-    return f"{base}{_recommendation_suffix(language, recommendations)}"
+    return smart_clarification_message(language, recommendations, user_input)
 
 
 def _adaptive_recommendation_limit(confidence: float, low_threshold: float, high_threshold: float) -> int:
-    if confidence > high_threshold:
-        return 1
-    if confidence < low_threshold:
-        return 3
-    return 2
+    return adaptive_recommendation_limit(confidence, low_threshold, high_threshold)
 
 
 def _apply_recommendation_continuity(session: Dict[str, Any], recommendations: List[str]) -> List[str]:
-    previous = [str(item) for item in session.get("last_recommendations", []) if str(item).strip()]
-    filtered = [item for item in recommendations if item not in previous]
-    final_list = filtered or recommendations[:1]
-    session["last_recommendations"] = final_list[:3]
-    return final_list
+    return apply_recommendation_continuity(session, recommendations)
 
 
 def _looks_like_field_value(field_name: Optional[str], user_input: str) -> bool:
-    value = (user_input or "").strip()
-    if not value or not field_name:
-        return False
-
-    if field_name == "phone":
-        return bool(re.fullmatch(r"\D*\d\D*\d\D*\d\D*\d\D*\d\D*\d\D*\d\D*\d\D*\d\D*\d\D*", value))
-
-    if field_name == "aadhaar_number":
-        digits = re.sub(r"\D", "", value)
-        return len(digits) == 12
-
-    if field_name == "annual_income":
-        candidate = value.replace(",", "")
-        return bool(re.fullmatch(r"\d+(\.\d+)?", candidate))
-
-    if field_name == "full_name":
-        lowered = value.lower()
-        if "?" in lowered or "kya" in lowered or "what" in lowered or "scheme" in lowered or "yojana" in lowered:
-            return False
-        return bool(re.fullmatch(r"[A-Za-z\s.'-]{2,80}", value))
-
-    return False
+    return looks_like_field_value(field_name, user_input)
 
 
 def _build_confirmation_summary(session: Dict[str, Any], language: str) -> str:
@@ -977,6 +1594,7 @@ def _confirmation_handler(
     language: str,
 ) -> Dict[str, Any]:
     cleaned_input = _normalize_mixed_input_text(user_input).lower()
+    session["_confirmation_handled"] = True
 
     if _is_restart_command(cleaned_input):
         fresh = _safe_reset_session(session_id, language)
@@ -996,20 +1614,17 @@ def _confirmation_handler(
         session["confirmation_done"] = True
         session["confirmation_state"] = "confirmed"
         session["session_complete"] = True
-        done_text = (
-            "धन्यवाद, आपका फॉर्म पुष्टि हो गया है।"
-            if language == "hi"
-            else "Thank you, your form is confirmed."
-        )
-        done_text = f"{done_text}\n\n{_closing_summary(session, language)}"
+        session["dialogue_state"] = "completed"
+        done_text = "आपका फॉर्म सफलतापूर्वक पूरा हो गया है।" if language == "hi" else "Your form is completed successfully."
         _append_history(session, "assistant", done_text)
         update_session(session_id, session)
         return _build_response(session_id, done_text, None, True, True, None, session=session)
 
-    if _is_negative(cleaned_input):
+    if _is_negative(cleaned_input) or "change" in cleaned_input:
         session["confirmation_done"] = False
         session["confirmation_state"] = "pending"
         previous = _move_to_previous_field(session)
+        session["dialogue_state"] = "collecting_info"
         question = get_field_question(previous, language)
         guide = (
             f"ठीक है, हम इसे ठीक करते हैं। {question}"
@@ -1156,10 +1771,182 @@ def handle_conversation(session_id: str, user_input: str, language: Optional[str
 
     # Use normalized text to avoid double escaping when upstream routes already sanitize payloads.
     cleaned_input = _normalize_mixed_input_text(validated_input.normalized_text)
+    user_history_context = _fetch_user_history_context(session)
+    history_last_scheme = str(user_history_context.get("last_scheme") or "").strip()
+    if history_last_scheme and not str(session.get("last_scheme") or "").strip():
+        session["last_scheme"] = history_last_scheme
+    last_scheme = str(session.get("last_scheme") or session.get("selected_scheme") or session.get("current_scheme") or "").strip()
+    session["_context_applied"] = False
+    if is_vague_reference(cleaned_input) and last_scheme and not _has_explicit_scheme_reference(cleaned_input):
+        cleaned_input = f"{last_scheme} {cleaned_input}".strip()
+        session["_context_applied"] = True
+    context_applied = bool(session.get("_context_applied", False))
+
     _update_dialogue_state(session)
+    session["info_detected"] = False
+    session["_confirmation_handled"] = False
+
+    pending_next_field = get_next_field(session)
+    if pending_next_field is None and not bool(session.get("session_complete")):
+        session["dialogue_state"] = "confirming"
+        session["confirmation_state"] = "pending"
+
+    if str(session.get("dialogue_state") or "").strip().lower() == "confirming":
+        entry_language = normalize_language_code(language or session.get("language") or _detect_language(cleaned_input), default="en")
+        session["language"] = entry_language
+        _append_history(session, "user", cleaned_input)
+        return _confirmation_handler(session_id, session, cleaned_input, entry_language)
+
+    entry_language = normalize_language_code(language or session.get("language") or _detect_language(cleaned_input), default="en")
+    session["language"] = entry_language
+
+    if context_applied and _is_context_info_followup(cleaned_input):
+        session["onboarding_done"] = True
+        session["last_intent"] = INTENT_SCHEME_QUERY
+        session["last_secondary_intents"] = []
+        session["last_action"] = "info"
+        session["_intent_debug"] = {
+            "primary_intent": INTENT_SCHEME_QUERY,
+            "confidence": 0.95,
+            "fallback_used": False,
+            "secondary_intents": [],
+            "raw_model_output": None,
+            "normalized_intent": INTENT_SCHEME_QUERY,
+            "context_used": True,
+            "model_used": False,
+            "source": "context_followup_resolution",
+        }
+        referenced_scheme = str(session.get("last_scheme") or session.get("selected_scheme") or "this scheme").strip() or "this scheme"
+        if entry_language == "hi":
+            response_text = (
+                f"{referenced_scheme} के लिए पात्रता और दस्तावेज़ मैं साझा कर सकता हूँ। "
+                "Eligibility, required documents और application process देखिए।"
+            )
+        else:
+            response_text = (
+                f"For {referenced_scheme}, I can share eligibility and documents. "
+                "Please check eligibility, required documents, and application process."
+            )
+        _append_history(session, "user", cleaned_input)
+        _append_history(session, "assistant", response_text)
+        update_session(session_id, session)
+        return _build_response(
+            session_id=session_id,
+            response_text=response_text,
+            field_name=None,
+            validation_passed=True,
+            validation_error=None,
+            session_complete=bool(session.get("session_complete", False)),
+            mode="info",
+            action="ask_to_apply_or_more_info",
+            session=session,
+            quick_actions=build_quick_actions(entry_language, "info", "ask_to_apply_or_more_info", session.get("last_scheme"), bool(session.get("session_complete", False))),
+            voice_text=response_text,
+        )
+
+    if _is_autofill_command(cleaned_input):
+        _append_history(session, "user", cleaned_input)
+        if session.get("session_complete"):
+            autofill_result = _run_autofill_with_timeout(session, entry_language)
+            autofill_status = str((autofill_result or {}).get("status") or "failed").strip().lower()
+            if autofill_status not in {"success", "failed", "skipped"}:
+                autofill_status = "failed"
+            auto_msg = str((autofill_result or {}).get("message") or _autofill_fallback_message(entry_language))
+            _append_history(session, "assistant", auto_msg)
+            update_session(session_id, session)
+            return _build_response(
+                session_id=session_id,
+                response_text=auto_msg,
+                field_name=None,
+                validation_passed=True,
+                validation_error=None,
+                session_complete=True,
+                mode="action",
+                action="auto_fill_form",
+                session=session,
+                quick_actions=build_quick_actions(entry_language, "action", "auto_fill_form", session.get("last_scheme"), True),
+                voice_text=auto_msg,
+                autofill_status=autofill_status,
+            )
+
+        auto_msg = (
+            "Auto-fill शुरू करने से पहले 1-2 जानकारी और चाहिए। चलिए, उसे पूरा करते हैं।"
+            if entry_language == "hi"
+            else "Before auto-fill, I need 1-2 more details. Let us finish those first."
+        )
+        _append_history(session, "assistant", auto_msg)
+        update_session(session_id, session)
+        return _build_response(
+            session_id=session_id,
+            response_text=auto_msg,
+            field_name=session.get("next_field") or get_next_field(session),
+            validation_passed=True,
+            validation_error=None,
+            session_complete=False,
+            mode="action",
+            action="continue_form",
+            session=session,
+            quick_actions=build_quick_actions(entry_language, "action", "continue_form", session.get("last_scheme"), False),
+            voice_text=auto_msg,
+            autofill_status="skipped",
+        )
+
+    if detect_information_input(user_input):
+        session["info_detected"] = True
+        session["onboarding_done"] = True
+        session["last_intent"] = "provide_information"
+        session["last_secondary_intents"] = []
+        session["last_action"] = "action"
+        session["_intent_debug"] = {
+            "primary_intent": "provide_information",
+            "confidence": 0.95,
+            "fallback_used": False,
+            "secondary_intents": [],
+            "raw_model_output": None,
+            "normalized_intent": "provide_information",
+            "context_used": False,
+            "model_used": False,
+            "source": "rule_based_info_detection",
+        }
+        _apply_info_detection_to_profile(session, cleaned_input, entry_language)
+
+        response_text = (
+            get_field_question(session.get("next_field"), entry_language)
+            if session.get("next_field")
+            else _build_confirmation_summary(session, entry_language)
+        )
+        _append_history(session, "user", cleaned_input)
+        _append_history(session, "assistant", response_text)
+        update_session(session_id, session)
+
+        return _build_response(
+            session_id=session_id,
+            response_text=response_text,
+            field_name=session.get("next_field"),
+            validation_passed=True,
+            validation_error=None,
+            session_complete=bool(session.get("session_complete", False)),
+            mode="action",
+            action="collect_information",
+            session=session,
+            quick_actions=build_quick_actions(entry_language, "action", "collect_information", session.get("last_scheme"), False),
+            voice_text=response_text,
+        )
 
     # Cold-start onboarding for first interaction in a new session.
-    if not session.get("onboarding_done") and not session.get("conversation_history"):
+    lowered_first_turn = cleaned_input.lower()
+    is_intentful_first_turn = _has_scheme_signal(lowered_first_turn) or _is_apply_intent_signal(cleaned_input)
+    should_show_onboarding = (
+        is_generic_help_query(cleaned_input)
+        or lowered_first_turn in {"hi", "hello", "help", "madad"}
+        or len(lowered_first_turn.split()) <= 2
+    )
+    if (
+        not session.get("onboarding_done")
+        and not session.get("conversation_history")
+        and not is_intentful_first_turn
+        and should_show_onboarding
+    ):
         lang_probe = normalize_language_code(language or session.get("language") or _detect_language(cleaned_input), default="en")
         onboarding = "आपको किस तरह की मदद चाहिए?" if lang_probe == "hi" else "What kind of help do you need?"
         session["language"] = lang_probe
@@ -1179,21 +1966,384 @@ def handle_conversation(session_id: str, user_input: str, language: Optional[str
             quick_actions=build_quick_actions(lang_probe, "clarify", "onboarding", session.get("last_scheme"), False),
             voice_text=onboarding,
         )
+    session["onboarding_done"] = True
+
+    # Safety-first fallback for noisy first-turn inputs so onboarding does not mask error handling.
+    if (
+        not session.get("conversation_history")
+        and not _has_scheme_signal(cleaned_input)
+        and not _is_apply_intent_signal(cleaned_input)
+        and is_unclear_input(cleaned_input)
+    ):
+        fallback_lang = normalize_language_code(language or session.get("language") or _detect_language(cleaned_input), default="en")
+        safe_text = "I couldn't find a clear match. Can you clarify your need?" if fallback_lang != "hi" else "मुझे स्पष्ट मैच नहीं मिला। क्या आप अपनी जरूरत स्पष्ट कर सकते हैं?"
+        session["last_action"] = "safe_fallback"
+        session["_safety_low_confidence"] = True
+        session["_safety_ambiguous"] = False
+        session["_safety_fallback_triggered"] = True
+        _append_history(session, "user", cleaned_input)
+        _append_history(session, "assistant", safe_text)
+        update_session(session_id, session)
+        return _build_response(
+            session_id=session_id,
+            response_text=safe_text,
+            field_name=None,
+            validation_passed=True,
+            validation_error=None,
+            session_complete=False,
+            mode="clarify",
+            action="safe_fallback",
+            session=session,
+            quick_actions=build_quick_actions(fallback_lang, "clarify", "safe_fallback", session.get("last_scheme"), False),
+            voice_text=safe_text,
+        )
 
     _maybe_update_feedback_from_input(session, cleaned_input)
-    normalized_input = normalize_for_intent(cleaned_input, language_hint=language or session.get("language"))
     if language and language.strip():
         session["language"] = normalize_language_code(language, default="en")
     elif session.get("language"):
         session["language"] = normalize_language_code(session.get("language"), default="en")
     else:
-        session["language"] = normalize_language_code(normalized_input.language or _detect_language(cleaned_input), default="en")
+        session["language"] = normalize_language_code(_detect_language(cleaned_input), default="en")
 
     current_field = session.get("next_field") or get_next_field(session)
     session["next_field"] = current_field
     lang = normalize_language_code(session.get("language", "en"), default="en")
     session["language"] = lang
     cleaned_input = _resolve_quick_action_input(cleaned_input, lang, session)
+
+    # First-turn non-domain noise should fail safely, not enter form flow.
+    if (
+        not session.get("conversation_history")
+        and not _has_scheme_signal(cleaned_input)
+        and not _is_apply_intent_signal(cleaned_input)
+        and not detect_information_input(cleaned_input)
+        and not is_generic_help_query(cleaned_input)
+    ):
+        safe_text = "I couldn't find a clear match. Can you clarify your need?" if lang != "hi" else "मुझे स्पष्ट मैच नहीं मिला। क्या आप अपनी जरूरत स्पष्ट कर सकते हैं?"
+        session["last_action"] = "safe_fallback"
+        session["_safety_low_confidence"] = True
+        session["_safety_ambiguous"] = False
+        session["_safety_fallback_triggered"] = True
+        _append_history(session, "user", cleaned_input)
+        _append_history(session, "assistant", safe_text)
+        update_session(session_id, session)
+        return _build_response(
+            session_id=session_id,
+            response_text=safe_text,
+            field_name=None,
+            validation_passed=True,
+            validation_error=None,
+            session_complete=False,
+            mode="clarify",
+            action="safe_fallback",
+            session=session,
+            quick_actions=build_quick_actions(lang, "clarify", "safe_fallback", session.get("last_scheme"), False),
+            voice_text=safe_text,
+        )
+
+    if session.get("info_detected"):
+        # Hard guard: once info path is selected in this turn, do not run model/intent logic.
+        response_text = get_field_question(session.get("next_field"), lang)
+        _append_history(session, "assistant", response_text)
+        update_session(session_id, session)
+        return _build_response(
+            session_id=session_id,
+            response_text=response_text,
+            field_name=session.get("next_field"),
+            validation_passed=True,
+            validation_error=None,
+            session_complete=False,
+            mode="action",
+            action="collect_information",
+            session=session,
+            quick_actions=build_quick_actions(lang, "action", "collect_information", session.get("last_scheme"), False),
+            voice_text=response_text,
+        )
+
+    if (
+        current_field
+        and _looks_like_field_value(current_field, cleaned_input)
+        and not _is_apply_intent_signal(cleaned_input)
+        and not _has_scheme_signal(cleaned_input)
+    ):
+        validation = validate_field(current_field, cleaned_input, language=lang)
+        if validation.get("valid"):
+            _append_history(session, "user", cleaned_input)
+            session.setdefault("user_profile", {})[current_field] = str(validation.get("normalized") or "")
+            session.setdefault("field_completion", {})[current_field] = True
+            active_fields = _session_fields(session)
+            if current_field in active_fields:
+                session["last_completed_field_index"] = active_fields.index(current_field)
+            next_field_after = get_next_field(session)
+            session["next_field"] = next_field_after
+            session["session_complete"] = False
+            session["confirmation_done"] = False
+
+            if next_field_after is None:
+                session["confirmation_state"] = "pending"
+                session["dialogue_state"] = "confirming"
+                confirmation_text = _build_confirmation_summary(session, lang)
+                confirmation_text = (
+                    f"{confirmation_text}\n\nकृपया सब जानकारी देखकर हाँ कहें या बदलाव बताएं।"
+                    if lang == "hi"
+                    else f"{confirmation_text}\n\nPlease review all details and say yes to submit, or ask to change any field."
+                )
+                _append_history(session, "assistant", confirmation_text)
+                update_session(session_id, session)
+                return _build_response(
+                    session_id=session_id,
+                    response_text=confirmation_text,
+                    field_name=None,
+                    validation_passed=True,
+                    validation_error=None,
+                    session_complete=False,
+                    mode="action",
+                    action="confirm_details",
+                    session=session,
+                    quick_actions=build_quick_actions(lang, "action", "confirm_details", session.get("last_scheme"), False),
+                    voice_text=confirmation_text,
+                )
+
+            question_text = get_field_question(next_field_after, lang)
+            session["dialogue_state"] = "collecting_info"
+            _append_history(session, "assistant", question_text)
+            update_session(session_id, session)
+            return _build_response(
+                session_id=session_id,
+                response_text=question_text,
+                field_name=next_field_after,
+                validation_passed=True,
+                validation_error=None,
+                session_complete=False,
+                mode="action",
+                action="collect_information",
+                session=session,
+                quick_actions=build_quick_actions(lang, "action", "collect_information", session.get("last_scheme"), False),
+                voice_text=question_text,
+            )
+
+    # Global apply override signal: intent or explicit apply phrase should always force form start.
+    lowered_input = str(cleaned_input or "").lower()
+    apply_intent_requested = "apply" in lowered_input
+    session_context_for_intent = {
+        "last_intent": session.get("last_intent"),
+        "last_action": session.get("last_action"),
+        "last_scheme": session.get("last_scheme") or session.get("selected_scheme") or session.get("current_scheme"),
+        "language": lang,
+    }
+    intent_probe = INTENT_SERVICE.detect(
+        cleaned_input,
+        debug=True,
+        session_context=session_context_for_intent,
+    )
+    probed_intent = str(intent_probe.get("intent") or "general_query").strip().lower()
+    probed_secondary_intents = [str(item or "").strip().lower() for item in intent_probe.get("secondary_intents", [])]
+    apply_intent_requested = (
+        apply_intent_requested
+        or _is_apply_intent_signal(cleaned_input)
+        or probed_intent == "apply_scheme"
+        or any(item == "apply_scheme" for item in probed_secondary_intents)
+    )
+
+    # Returning-user lightweight context nudge on first turn, unless input already names a scheme.
+    if (
+        not session.get("conversation_history")
+        and history_last_scheme
+        and not _has_explicit_scheme_reference(cleaned_input)
+        and not apply_intent_requested
+    ):
+        returning_prompt = _build_returning_user_prompt(lang, history_last_scheme)
+        _append_history(session, "assistant", returning_prompt)
+        update_session(session_id, session)
+        return _build_response(
+            session_id=session_id,
+            response_text=returning_prompt,
+            field_name=None,
+            validation_passed=True,
+            validation_error=None,
+            session_complete=False,
+            mode="clarify",
+            action="returning_user_context",
+            session=session,
+            quick_actions=build_quick_actions(lang, "clarify", "returning_user_context", history_last_scheme, False),
+            voice_text=returning_prompt,
+        )
+
+    scheme_detection_input = cleaned_input
+    if (
+        _is_vague_scheme_reference(cleaned_input)
+        and history_last_scheme
+        and not _has_explicit_scheme_reference(cleaned_input)
+        and current_field is None
+    ):
+        # Resolve pronoun-like references using known last scheme without altering original user text.
+        scheme_detection_input = f"{history_last_scheme} {cleaned_input}".strip()
+
+    mentioned_schemes = _detect_scheme_mentions(scheme_detection_input, limit=5)
+    session["_scheme_detection_input"] = scheme_detection_input
+    session["_scheme_detection_candidates"] = list(mentioned_schemes)
+    session["_scheme_detection_decision"] = "none"
+    session["_safety_low_confidence"] = False
+    session["_safety_ambiguous"] = False
+    session["_safety_fallback_triggered"] = False
+    session["_apply_flow_forced"] = False
+
+    apply_signal = apply_intent_requested or _is_apply_intent_signal(cleaned_input)
+
+    strong_matches = [
+        item
+        for item in mentioned_schemes
+        if float(item.get("score") or 0.0) > 0.8
+    ]
+
+    explicit_match = _prefer_explicit_scheme_match(cleaned_input, mentioned_schemes)
+    if explicit_match is not None:
+        strong_matches = [explicit_match]
+
+    if apply_intent_requested:
+        candidates = list(mentioned_schemes)
+        selected_scheme = _resolve_apply_target_scheme(session, cleaned_input, candidates, "general")
+
+        session["selected_scheme"] = selected_scheme
+        session["current_scheme"] = selected_scheme
+        session["last_scheme"] = selected_scheme
+
+        fields = get_fields_for_scheme(selected_scheme)
+        if get_form_type_for_scheme(selected_scheme) == "generic":
+            fields = ["full_name", "phone", "aadhaar_number"]
+            session["_force_minimal_generic_fields"] = True
+        else:
+            session["_force_minimal_generic_fields"] = False
+        session["field_completion"] = {field: False for field in fields}
+        session["next_field"] = fields[0] if fields else None
+        session["session_complete"] = False
+        session["confirmation_done"] = False
+        session["confirmation_state"] = "pending"
+        session["dialogue_state"] = "collecting_info"
+        session["action_confirmation_pending"] = False
+        session["_apply_flow_forced"] = True
+        session["_scheme_detection_decision"] = "apply_forced_global"
+
+        intro = (
+            f"मैं आपकी {selected_scheme} के लिए आवेदन में मदद करूंगा। चलिए शुरू करते हैं।"
+            if lang == "hi"
+            else f"I will help you apply for {selected_scheme}. Let's start."
+        )
+        next_field = session.get("next_field")
+        response_text = intro if next_field is None else f"{intro} {get_field_question(next_field, lang)}"
+        _append_history(session, "user", cleaned_input)
+        _append_history(session, "assistant", response_text)
+        update_session(session_id, session)
+
+        return _build_response(
+            session_id=session_id,
+            response_text=response_text,
+            field_name=next_field,
+            validation_passed=True,
+            validation_error=None,
+            session_complete=False,
+            mode="action",
+            action="apply_scheme_forced_start",
+            session=session,
+            quick_actions=build_quick_actions(lang, "action", "apply_scheme_forced_start", selected_scheme, False),
+            voice_text=response_text,
+        )
+
+    if len(strong_matches) == 1:
+        detected_scheme = str(strong_matches[0].get("scheme") or "").strip()
+        session["current_scheme"] = detected_scheme
+        session["last_scheme"] = detected_scheme
+        session["_scheme_detection_decision"] = "auto_select"
+        if not session.get("selected_scheme"):
+            session["selected_scheme"] = resolve_scheme_name(detected_scheme)
+    elif mentioned_schemes and float(mentioned_schemes[0].get("score") or 0.0) < 0.7 and not apply_signal and not context_applied:
+        session["_scheme_detection_decision"] = "low_confidence"
+        session["_safety_low_confidence"] = True
+        session["_safety_fallback_triggered"] = True
+        confirm_text = (
+            "मुझे कई संभावित योजनाएँ मिली हैं, क्या आप पुष्टि कर सकते हैं?"
+            if lang == "hi"
+            else "I found multiple possible schemes, can you confirm?"
+        )
+        _append_history(session, "user", cleaned_input)
+        _append_history(session, "assistant", confirm_text)
+        update_session(session_id, session)
+        return _build_response(
+            session_id=session_id,
+            response_text=confirm_text,
+            field_name=None,
+            validation_passed=True,
+            validation_error=None,
+            session_complete=False,
+            mode="clarify",
+            action="clarify_scheme",
+            session=session,
+            quick_actions=build_quick_actions(lang, "clarify", "clarify_scheme", session.get("last_scheme"), False),
+            voice_text=confirm_text,
+        )
+    elif (
+        len(mentioned_schemes) >= 2
+        and _has_scheme_signal(cleaned_input)
+        and not apply_signal
+        and not context_applied
+        and bool(explicit_match)
+    ):
+        first = str(mentioned_schemes[0].get("scheme") or "").strip()
+        second = str(mentioned_schemes[1].get("scheme") or "").strip()
+        session["_scheme_detection_decision"] = "ambiguous"
+        session["_safety_ambiguous"] = True
+        session["_safety_fallback_triggered"] = True
+        ambiguous_text = (
+            f"क्या आपका मतलब {first} या {second} है?"
+            if lang == "hi"
+            else f"Did you mean: {first} or {second}?"
+        )
+        _append_history(session, "user", cleaned_input)
+        _append_history(session, "assistant", ambiguous_text)
+        update_session(session_id, session)
+        return _build_response(
+            session_id=session_id,
+            response_text=ambiguous_text,
+            field_name=None,
+            validation_passed=True,
+            validation_error=None,
+            session_complete=False,
+            mode="clarify",
+            action="clarify_scheme",
+            session=session,
+            quick_actions=build_quick_actions(lang, "clarify", "clarify_scheme", session.get("last_scheme"), False),
+            voice_text=ambiguous_text,
+        )
+    elif not mentioned_schemes and _has_scheme_signal(cleaned_input):
+        explicit_phrase = _extract_explicit_scheme_phrase(cleaned_input)
+        if explicit_phrase:
+            session["current_scheme"] = explicit_phrase
+            session["last_scheme"] = explicit_phrase
+            session["selected_scheme"] = resolve_scheme_name(explicit_phrase)
+            session["_scheme_detection_decision"] = "explicit_generic"
+        elif not apply_signal and not context_applied:
+            session["_scheme_detection_decision"] = "none"
+            session["_safety_fallback_triggered"] = True
+            no_match_text = "आप किस योजना के बारे में पूछ रहे हैं?" if lang == "hi" else "Which scheme are you asking about?"
+            _append_history(session, "user", cleaned_input)
+            _append_history(session, "assistant", no_match_text)
+            update_session(session_id, session)
+            return _build_response(
+                session_id=session_id,
+                response_text=no_match_text,
+                field_name=None,
+                validation_passed=True,
+                validation_error=None,
+                session_complete=False,
+                mode="clarify",
+                action="clarify_scheme",
+                session=session,
+                quick_actions=build_quick_actions(lang, "clarify", "clarify_scheme", session.get("last_scheme"), False),
+                voice_text=no_match_text,
+            )
+        else:
+            session["_scheme_detection_decision"] = "apply_signal_no_match_override"
 
     if _is_restart_command(cleaned_input):
         _append_history(session, "user", cleaned_input)
@@ -1250,7 +2400,7 @@ def handle_conversation(session_id: str, user_input: str, language: Optional[str
             quick_actions=build_quick_actions(lang, "action", "correction", session.get("last_scheme"), False),
         )
 
-    normalized_input = normalize_for_intent(cleaned_input, language_hint=lang)
+    normalized_input = normalize_for_intent(scheme_detection_input, language_hint=lang)
 
     # Clarification resume path: enrich terse follow-up using stack context.
     if session.get("clarification_stack") and len((normalized_input.intent_text or cleaned_input).split()) <= 5:
@@ -1269,23 +2419,130 @@ def handle_conversation(session_id: str, user_input: str, language: Optional[str
     need_category = str(need_signal.get("category") or "")
     need_confidence = float(need_signal.get("confidence") or 0.0)
     user_need_profile = _update_user_need_profile(session, cleaned_input, need_category=need_category)
+    user_profile_for_rag = _sanitize_user_profile_for_rag(user_need_profile)
     progress_started = any(session.get("field_completion", {}).get(field, False) for field in _session_fields(session))
-    intent_debug = INTENT_SERVICE.detect(normalized_input.intent_text or cleaned_input, debug=True)
-    intent_decision = predict_intent_detailed(
-        normalized_input.intent_text or cleaned_input,
-        session_context={
-            "last_intent": session.get("last_intent"),
-            "last_action": session.get("last_action"),
-            "language": lang,
-        },
+    session_context_for_intent = {
+        "last_intent": session.get("last_intent"),
+        "last_action": session.get("last_action"),
+        "last_scheme": session.get("last_scheme") or session.get("selected_scheme") or session.get("current_scheme"),
+        "language": lang,
+    }
+    intent_debug = INTENT_SERVICE.detect(
+        normalized_input.intent_text or cleaned_input, 
+        debug=True, 
+        session_context=session_context_for_intent
     )
-    intent_decision["primary_intent"] = intent_debug.get("intent", intent_decision.get("primary_intent"))
-    intent_decision["confidence"] = round(float(intent_debug.get("confidence", 0.0)) / 100.0, 4)
-    intent_decision["hybrid_debug"] = intent_debug.get("debug", {})
-    model_intent = intent_decision["primary_intent"]
-    model_confidence = float(intent_decision["confidence"])
-    model_fallback_used = bool(intent_decision["fallback_used"])
-    secondary_intents = intent_decision.get("secondary_intents", [])
+    
+    model_intent = intent_debug.get("intent", "general_query")
+    model_confidence = float(intent_debug.get("confidence", 0.0)) / 100.0
+    debug_info = intent_debug.get("debug", {})
+    model_fallback_used = bool(debug_info.get("fallback_used", False))
+    secondary_intents = intent_debug.get("secondary_intents", [])
+
+    intent_decision = {
+        "primary_intent": model_intent,
+        "confidence": round(model_confidence, 4),
+        "fallback_used": model_fallback_used,
+        "secondary_intents": secondary_intents,
+        "raw_model_output": debug_info.get("raw_model_output"),
+        "normalized_intent": debug_info.get("normalized_intent"),
+        "context_used": debug_info.get("context_used"),
+        "hybrid_debug": debug_info,
+    }
+
+    state_transition = f"{session.get('state', STATE_IDLE)}->{session.get('state', STATE_IDLE)}"
+    state_result = apply_state_transition(session, cleaned_input, str(model_intent or ""))
+    state_transition = str(state_result.get("state_transition") or state_transition)
+
+    intent_decision["state_debug"] = {
+        "current_state": state_result.get("current_state", session.get("state", STATE_IDLE)),
+        "state_transition": state_transition,
+        "current_scheme": state_result.get("current_scheme", session.get("current_scheme")),
+        "collected_fields": state_result.get("collected_fields", dict(session.get("collected_fields") or {})),
+        "missing_fields": state_result.get("missing_fields", list(session.get("missing_fields") or [])),
+    }
+
+    if state_result.get("handled"):
+        if apply_signal and str(state_result.get("action") or "") == "state_select_scheme":
+            selected_scheme = _resolve_apply_target_scheme(session, cleaned_input, list(mentioned_schemes), "general")
+
+            session["selected_scheme"] = selected_scheme
+            session["current_scheme"] = selected_scheme
+            session["last_scheme"] = selected_scheme
+
+            fields = get_fields_for_scheme(selected_scheme)
+            if get_form_type_for_scheme(selected_scheme) == "generic":
+                fields = ["full_name", "phone", "aadhaar_number"]
+                session["_force_minimal_generic_fields"] = True
+            else:
+                session["_force_minimal_generic_fields"] = False
+            next_field = fields[0] if fields else None
+            session["field_completion"] = {field: False for field in fields}
+            session["next_field"] = next_field
+            session["session_complete"] = False
+            session["confirmation_done"] = False
+            session["confirmation_state"] = "pending"
+            session["dialogue_state"] = "collecting_info"
+            session["action_confirmation_pending"] = False
+            session["_apply_flow_forced"] = True
+
+            intro = (
+                f"मैं आपकी {selected_scheme} के लिए आवेदन में मदद करूंगा। चलिए शुरू करते हैं।"
+                if lang == "hi"
+                else f"I will help you apply for {selected_scheme}. Let's start."
+            )
+            response_text = intro if next_field is None else f"{intro} {get_field_question(next_field, lang)}"
+            _append_history(session, "user", cleaned_input)
+            _append_history(session, "assistant", response_text)
+            update_session(session_id, session)
+
+            return _build_response(
+                session_id=session_id,
+                response_text=response_text,
+                field_name=next_field,
+                validation_passed=True,
+                validation_error=None,
+                session_complete=False,
+                mode="action",
+                action="apply_scheme_forced_start",
+                session=session,
+                quick_actions=build_quick_actions(lang, "action", "apply_scheme_forced_start", selected_scheme, False),
+                voice_text=response_text,
+            )
+
+        _sync_state_machine_fields_to_profile(session)
+        if session.get("current_scheme") and not session.get("selected_scheme"):
+            session["selected_scheme"] = resolve_scheme_name(session.get("current_scheme"))
+            session["last_scheme"] = session.get("current_scheme")
+        session["last_intent"] = model_intent
+        session["last_secondary_intents"] = secondary_intents
+        session["last_action"] = "action"
+        if debug:
+            session["_intent_debug"] = intent_decision
+        else:
+            session.pop("_intent_debug", None)
+
+        response_text = str(state_result.get("response_text") or "")
+        action = str(state_result.get("action") or "state_machine")
+        session_complete = bool(state_result.get("session_complete", False))
+        _append_history(session, "user", cleaned_input)
+        if response_text:
+            _append_history(session, "assistant", response_text)
+        update_session(session_id, session)
+
+        return _build_response(
+            session_id=session_id,
+            response_text=response_text,
+            field_name=None,
+            validation_passed=True,
+            validation_error=None,
+            session_complete=session_complete,
+            mode="action",
+            action=action,
+            session=session,
+            quick_actions=build_quick_actions(lang, "action", action, session.get("last_scheme"), session_complete),
+            voice_text=response_text,
+        )
 
     detected_intent, detected_mode = detect_intent_and_mode(
         normalized_input.intent_text or cleaned_input,
@@ -1293,10 +2550,31 @@ def handle_conversation(session_id: str, user_input: str, language: Optional[str
         confidence=model_confidence,
     )
 
+    lowered_input = str(cleaned_input or "").lower()
+    apply_intent_requested = (
+        str(model_intent or "").strip().lower() in APPLY_INTENTS
+        or str(detected_intent or "").strip().lower() in APPLY_INTENTS
+        or any(str(intent or "").strip().lower() in APPLY_INTENTS for intent in secondary_intents)
+        or apply_signal
+    )
+    forced_scheme_hint = _forced_scheme_from_query(cleaned_input)
+    explicit_apply_request = (
+        any(token in lowered_input for token in ("apply", "application", "enroll", "registration"))
+        and bool(session.get("selected_scheme") or _extract_explicit_scheme_phrase(cleaned_input))
+    )
+    if apply_intent_requested and not forced_scheme_hint:
+        explicit_apply_request = True
+    if explicit_apply_request:
+        detected_mode = "action"
+
     has_action_signal = detected_intent in ACTION_INTENTS or any(intent in ACTION_INTENTS for intent in secondary_intents)
     has_info_signal = detected_intent in INFO_INTENTS or any(intent in INFO_INTENTS for intent in secondary_intents)
     if has_action_signal and has_info_signal and not progress_started:
         detected_mode = "clarify"
+    if explicit_apply_request:
+        detected_mode = "action"
+    if apply_intent_requested and not forced_scheme_hint:
+        detected_mode = "action"
 
     if detected_mode == "info":
         mode = "info"
@@ -1313,8 +2591,10 @@ def handle_conversation(session_id: str, user_input: str, language: Optional[str
     conversational_confidence = float((intent_debug.get("debug") or {}).get("conversation_confidence") or 0.0)
     if conversational_intent == "correction":
         mode = "action"
-    if conversational_confidence and conversational_confidence < 0.42:
+    if conversational_confidence and conversational_confidence < 0.42 and not explicit_apply_request:
         mode = "clarify"
+    if apply_intent_requested and not forced_scheme_hint:
+        mode = "action"
 
     session["last_intent"] = model_intent
     session["last_secondary_intents"] = secondary_intents
@@ -1324,12 +2604,14 @@ def handle_conversation(session_id: str, user_input: str, language: Optional[str
     else:
         session.pop("_intent_debug", None)
 
+    raw_input = normalized_input.intent_text or cleaned_input
     log_event(
         "conversation_routing_decision",
         endpoint="conversation_service",
         status="success",
         session_id=session_id,
-        user_input=(normalized_input.intent_text or cleaned_input)[:220],
+        user_input_length=len(raw_input or ""),
+        user_input_fingerprint=fingerprint_text(raw_input),
         detected_intent=detected_intent,
         model_intent=model_intent,
         confidence=round(model_confidence, 4),
@@ -1356,16 +2638,16 @@ def handle_conversation(session_id: str, user_input: str, language: Optional[str
     low_threshold = float(thresholds.get("low", 0.6))
     high_threshold = float(thresholds.get("high", 0.8))
     recommendation_limit = _adaptive_recommendation_limit(need_confidence, low_threshold, high_threshold)
+    if mode == "info" and _is_broad_discovery_request(normalized_input.intent_text or cleaned_input):
+        recommendation_limit = max(3, recommendation_limit)
     short_mode = _is_short_query(normalized_input.intent_text or cleaned_input)
     session["past_need_confidence"] = need_confidence
 
     if cleaned_input.lower() in {"auto fill form", "autofill", "auto-fill"}:
         if session.get("session_complete"):
-            auto_msg = (
-                "बहुत बढ़िया, आपकी जानकारी पूरी है। अब Auto-fill चलाइए, मैं फॉर्म अपने-आप भरवा दूँगा।"
-                if lang == "hi"
-                else "Great, your details are complete. Run Auto-fill now and I will help prefill the form."
-            )
+            autofill_result = _run_autofill_with_timeout(session, lang)
+            auto_msg = str(autofill_result.get("message") or _autofill_fallback_message(lang))
+            autofill_status = str(autofill_result.get("status") or "failed")
             _append_history(session, "assistant", auto_msg)
             update_session(session_id, session)
             return _build_response(
@@ -1380,6 +2662,7 @@ def handle_conversation(session_id: str, user_input: str, language: Optional[str
                 session=session,
                 quick_actions=build_quick_actions(lang, "action", "auto_fill_form", session.get("last_scheme"), True),
                 voice_text=auto_msg,
+                autofill_status=autofill_status,
             )
         auto_msg = (
             "Auto-fill शुरू करने से पहले 1-2 जानकारी और चाहिए। चलिए, उसे पूरा करते हैं।"
@@ -1400,6 +2683,7 @@ def handle_conversation(session_id: str, user_input: str, language: Optional[str
             session=session,
             quick_actions=build_quick_actions(lang, "action", "continue_form", session.get("last_scheme"), False),
             voice_text=auto_msg,
+            autofill_status="skipped",
         )
 
     if cleaned_input.lower() in {"autofill completed", "autofill success", "auto fill done"}:
@@ -1422,14 +2706,11 @@ def handle_conversation(session_id: str, user_input: str, language: Optional[str
             session=session,
             quick_actions=build_quick_actions(lang, "action", "autofill_success", session.get("last_scheme"), True),
             voice_text=success_msg,
+            autofill_status="success",
         )
 
     if cleaned_input.lower() in {"autofill failed", "auto fill failed", "autofill error"}:
-        failure_msg = (
-            "कोई बात नहीं, कभी-कभी ऑटो-फिल में दिक्कत आती है। मैं step-by-step आपके साथ manually भरवा देता हूँ।"
-            if lang == "hi"
-            else "No worries, auto-fill can fail sometimes. I can guide you step-by-step to fill it manually."
-        )
+        failure_msg = _autofill_fallback_message(lang)
         recovery = get_field_question(session.get("next_field") or get_next_field(session), lang)
         merged_msg = f"{failure_msg} {recovery}".strip()
         _append_history(session, "assistant", merged_msg)
@@ -1446,17 +2727,73 @@ def handle_conversation(session_id: str, user_input: str, language: Optional[str
             session=session,
             quick_actions=build_quick_actions(lang, "action", "autofill_recovery", session.get("last_scheme"), False),
             voice_text=merged_msg,
+            autofill_status="failed",
         )
 
-    if _is_unclear_input(cleaned_input) or _is_generic_help_query(normalized_input.intent_text or cleaned_input):
+    if apply_intent_requested and not forced_scheme_hint and not progress_started:
+        selected_scheme = _resolve_apply_target_scheme(session, cleaned_input, list(mentioned_schemes), need_category)
+
+        session["selected_scheme"] = selected_scheme
+        session["current_scheme"] = selected_scheme
+        session["last_scheme"] = selected_scheme
+
+        fields = get_fields_for_scheme(selected_scheme)
+        if get_form_type_for_scheme(selected_scheme) == "generic":
+            fields = ["full_name", "phone", "aadhaar_number"]
+            session["_force_minimal_generic_fields"] = True
+        else:
+            session["_force_minimal_generic_fields"] = False
+        next_field = fields[0] if fields else None
+
+        session["field_completion"] = {field: False for field in fields}
+        session["next_field"] = next_field
+        session["session_complete"] = False
+        session["confirmation_done"] = False
+        session["confirmation_state"] = "pending"
+        session["action_confirmation_pending"] = False
+        session["dialogue_state"] = "collecting_info"
+        session["_apply_flow_forced"] = True
+
+        intro = (
+            f"मैं आपकी {selected_scheme} के लिए आवेदन में मदद करूंगा। चलिए शुरू करते हैं।"
+            if lang == "hi"
+            else f"I will help you apply for {selected_scheme}. Let's start."
+        )
+        response_text = intro if next_field is None else f"{intro} {get_field_question(next_field, lang)}"
+
+        _append_history(session, "user", cleaned_input)
+        _append_history(session, "assistant", response_text)
+        update_session(session_id, session)
+        return _build_response(
+            session_id=session_id,
+            response_text=response_text,
+            field_name=next_field,
+            validation_passed=True,
+            validation_error=None,
+            session_complete=False,
+            mode="action",
+            action="apply_scheme_forced_start",
+            session=session,
+            quick_actions=build_quick_actions(lang, "action", "apply_scheme_forced_start", selected_scheme, False),
+            voice_text=response_text,
+        )
+
+    if (not explicit_apply_request) and (not forced_scheme_hint) and (
+        _is_unclear_input(cleaned_input) or _is_generic_help_query(normalized_input.intent_text or cleaned_input)
+    ):
         _push_clarification(session, normalized_input.intent_text or cleaned_input)
         record_fallback()
+        rag_query = {
+            "scheme": session.get("current_scheme"),
+            "user_profile": user_profile_for_rag,
+        }
         recommendations = recommend_schemes(
             normalized_input.intent_text or cleaned_input,
             lang,
             limit=recommendation_limit,
             need_category=need_category,
-            user_profile=user_need_profile,
+            user_profile=user_profile_for_rag,
+            scheme_context=rag_query,
             session_feedback=_session_feedback(session),
             context_fusion=fused_context,
         )
@@ -1465,7 +2802,8 @@ def handle_conversation(session_id: str, user_input: str, language: Optional[str
             lang,
             limit=recommendation_limit,
             need_category=need_category,
-            user_profile=user_need_profile,
+            user_profile=user_profile_for_rag,
+            scheme_context=rag_query,
             session_feedback=_session_feedback(session),
             context_fusion=fused_context,
         )
@@ -1510,6 +2848,14 @@ def handle_conversation(session_id: str, user_input: str, language: Optional[str
     if mode == "clarify":
         _push_clarification(session, normalized_input.intent_text or cleaned_input)
         response_text = _clarification_message(lang)
+        top_category = str(user_history_context.get("top_category") or "").strip()
+        if top_category and top_category != "general":
+            category_hint = (
+                f"पिछली बार आप अक्सर {top_category} से जुड़ी योजनाएँ देखते रहे हैं, चाहें तो मैं उसी तरह की 2-3 योजनाएँ दिखा सकता हूँ।"
+                if lang == "hi"
+                else f"You often explore {top_category}-related schemes, and I can suggest 2-3 similar options."
+            )
+            response_text = f"{response_text}\n\n{category_hint}"
         _append_history(session, "user", cleaned_input)
         _append_history(session, "assistant", response_text)
         update_session(session_id, session)
@@ -1530,47 +2876,149 @@ def handle_conversation(session_id: str, user_input: str, language: Optional[str
     if mode == "info":
         _append_history(session, "user", cleaned_input)
         query_for_rag = cleaned_input
-        if session.get("last_scheme") and is_followup_info_query(cleaned_input):
+        if session.get("last_scheme") and is_followup_info_query(cleaned_input) and not _has_explicit_scheme_reference(cleaned_input):
             query_for_rag = f"{session.get('last_scheme')} {cleaned_input}".strip()
+        elif (
+            _is_vague_scheme_reference(cleaned_input)
+            and history_last_scheme
+            and not _has_explicit_scheme_reference(cleaned_input)
+        ):
+            query_for_rag = f"{history_last_scheme} {cleaned_input}".strip()
 
-        rag_response, recommendations, has_match = retrieve_scheme_with_recommendations(
-            transcript=query_for_rag,
-            language=lang,
-            limit=recommendation_limit,
-            need_category=need_category,
-            user_profile=user_need_profile,
-            session_feedback=_session_feedback(session),
-            context_fusion=fused_context,
-        )
-        explainable = recommend_schemes_with_reasons(
-            query_for_rag,
-            language=lang,
-            limit=recommendation_limit,
-            need_category=need_category,
-            user_profile=user_need_profile,
-            session_feedback=_session_feedback(session),
-            context_fusion=fused_context,
-        )
-        recommendations = _apply_recommendation_continuity(session, recommendations)
+        rag_scheme_hint = session.get("current_scheme")
+        if mentioned_schemes:
+            rag_scheme_hint = str(mentioned_schemes[0].get("scheme") or "").strip() or None
+        rag_query = {
+            "scheme": rag_scheme_hint,
+            "user_profile": user_profile_for_rag,
+        }
+
+        fast_path_scheme = _forced_scheme_from_query(query_for_rag)
+        fast_path_used = bool(fast_path_scheme)
+        if fast_path_used:
+            rag_response = _fast_scheme_info_response(query_for_rag, lang, fast_path_scheme)
+            recommendations = _apply_recommendation_continuity(session, [fast_path_scheme])
+            has_match = True
+            explainable = [
+                {
+                    "scheme": fast_path_scheme,
+                    "reason": (
+                        "Query matched high-signal scheme keywords and was resolved via deterministic fast path."
+                        if lang != "hi"
+                        else "Query high-signal keyword match se deterministic fast path se resolve hui."
+                    ),
+                }
+            ]
+        else:
+            rag_response, recommendations, has_match = retrieve_scheme_with_recommendations(
+                transcript=query_for_rag,
+                language=lang,
+                limit=recommendation_limit,
+                need_category=need_category,
+                user_profile=user_profile_for_rag,
+                scheme_context=rag_query,
+                session_feedback=_session_feedback(session),
+                context_fusion=fused_context,
+            )
+            rag_safety = dict((rag_response or {}).get("safety") or {})
+            if bool(rag_safety.get("fallback_triggered", False)):
+                session["_safety_low_confidence"] = bool(rag_safety.get("low_confidence", True))
+                session["_safety_ambiguous"] = bool(rag_safety.get("ambiguous", False))
+                session["_safety_fallback_triggered"] = True
+                session["last_action"] = "safe_fallback"
+                fallback_text = str((rag_response or {}).get("confirmation") or "I couldn't find a clear match. Can you clarify your need?")
+                _append_history(session, "assistant", fallback_text)
+                update_session(session_id, session)
+                return _build_response(
+                    session_id=session_id,
+                    response_text=fallback_text,
+                    field_name=None,
+                    validation_passed=True,
+                    validation_error=None,
+                    session_complete=False,
+                    mode="clarify",
+                    action="safe_fallback",
+                    session=session,
+                    quick_actions=build_quick_actions(lang, "clarify", "safe_fallback", session.get("last_scheme"), False),
+                    voice_text=fallback_text,
+                )
+            explainable = recommend_schemes_with_reasons(
+                query_for_rag,
+                language=lang,
+                limit=recommendation_limit,
+                need_category=need_category,
+                user_profile=user_profile_for_rag,
+                scheme_context=rag_query,
+                session_feedback=_session_feedback(session),
+                context_fusion=fused_context,
+            )
+            recommendations = _apply_recommendation_continuity(session, recommendations)
+        top_category = str(user_history_context.get("top_category") or "").strip()
+        if (not fast_path_used) and top_category and top_category != "general":
+            category_recommendations = recommend_schemes(
+                f"{top_category} schemes",
+                lang,
+                limit=2,
+                need_category=top_category,
+                user_profile=user_profile_for_rag,
+                scheme_context=rag_query,
+                session_feedback=_session_feedback(session),
+                context_fusion=fused_context,
+            )
+            merged_recommendations: List[str] = []
+            for item in list(recommendations) + list(category_recommendations):
+                name = str(item or "").strip()
+                if not name or name in merged_recommendations:
+                    continue
+                merged_recommendations.append(name)
+            recommendations = merged_recommendations[: max(recommendation_limit, 3)]
+
+        if (not fast_path_used) and _is_broad_discovery_request(query_for_rag) and len(recommendations) < 2:
+            extra_recommendations = recommend_schemes(
+                query_for_rag,
+                lang,
+                limit=max(3, recommendation_limit),
+                need_category=need_category,
+                user_profile=user_profile_for_rag,
+                scheme_context={"scheme": None, "user_profile": user_profile_for_rag},
+                session_feedback=_session_feedback(session),
+                context_fusion=fused_context,
+            )
+            merged_recommendations = []
+            for item in list(recommendations) + list(extra_recommendations):
+                scheme_name = str(item or "").strip()
+                if not scheme_name or scheme_name in merged_recommendations:
+                    continue
+                merged_recommendations.append(scheme_name)
+            recommendations = merged_recommendations[:3]
 
         if rag_response is None:
-            rag_response = {
-                "confirmation": (
-                    "मैं आपकी बात समझ गया। मैं सही योजना चुनने में मदद कर सकता हूँ।"
-                    if lang == "hi"
-                    else "I understood your request. I can help you pick the right scheme."
-                ),
-                "explanation": (
-                    "कृपया बताएं कि आपको किसान, स्वास्थ्य, आवास, पेंशन या छात्रवृत्ति में से किस तरह की मदद चाहिए।"
-                    if lang == "hi"
-                    else "Please tell me whether you need help with farmer, health, housing, pension, or scholarship schemes."
-                ),
-                "next_step": (
-                    "आप पात्रता, दस्तावेज़, लाभ या आवेदन प्रक्रिया में से कुछ भी पूछ सकते हैं।"
-                    if lang == "hi"
-                    else "You can ask for eligibility, documents, benefits, or application process."
-                ),
-            }
+            current_scheme = str(session.get("current_scheme") or session.get("last_scheme") or "").strip()
+            if not current_scheme:
+                question = "आप किस योजना के बारे में पूछ रहे हैं?" if lang == "hi" else "Which scheme are you asking about?"
+                rag_response = {
+                    "confirmation": question,
+                    "explanation": question,
+                    "next_step": question,
+                }
+            else:
+                rag_response = {
+                    "confirmation": (
+                        "मैं आपकी बात समझ गया। मैं सही योजना चुनने में मदद कर सकता हूँ।"
+                        if lang == "hi"
+                        else "I understood your request. I can help you pick the right scheme."
+                    ),
+                    "explanation": (
+                        "कृपया अपनी ज़रूरत बताएं ताकि मैं सही योजना ढूंढ सकूँ।"
+                        if lang == "hi"
+                        else "Please share your need so I can fetch the right scheme details."
+                    ),
+                    "next_step": (
+                        "आप पात्रता, दस्तावेज़, लाभ या आवेदन प्रक्रिया में से कुछ भी पूछ सकते हैं।"
+                        if lang == "hi"
+                        else "You can ask for eligibility, documents, benefits, or application process."
+                    ),
+                }
             fallback_hint = (
                 "अगर चाहें तो मैं 2-3 योजनाएँ सीधे सुझाव दूँ, या हम आपकी प्रोफ़ाइल के हिसाब से चुनें।"
                 if lang == "hi"
@@ -1787,8 +3235,9 @@ def handle_conversation(session_id: str, user_input: str, language: Optional[str
             extraction_result = _apply_extracted_fields(session, extracted, lang)
             if extraction_result.get("conflicts"):
                 session["extraction_conflicts"] = extraction_result.get("conflicts")
-                option_field = next(iter(session["extraction_conflicts"].keys()))
-                options = session["extraction_conflicts"][option_field]
+                conflicts = dict(session.get("extraction_conflicts") or {})
+                option_field = next(iter(conflicts.keys()))
+                options = conflicts.get(option_field, [])
                 option_text = "; ".join(f"{idx + 1}. {value}" for idx, value in enumerate(options))
                 prompt = (
                     f"मुझे {FIELD_LABELS.get(option_field, {}).get('hi', option_field)} के लिए कई मान मिले। सही विकल्प चुनें: {option_text}"
@@ -1992,22 +3441,161 @@ class ConversationService:
             endpoint="conversation_service",
             status="started",
             session_id=session_id,
-            user_input=(user_input or "")[:220],
             user_input_length=len(user_input or ""),
+            user_input_fingerprint=fingerprint_text(user_input),
         )
         try:
-            result = handle_conversation(session_id=session_id, user_input=user_input, language=language, debug=debug)
+            session_for_limit = get_session(session_id) or create_session(session_id)
+            lang = normalize_language_code(language or session_for_limit.get("language") or "en", default="en")
+            limiter_key = _rate_limit_subject(session_id, session_for_limit)
+            if _is_rate_limited(limiter_key):
+                limited_result = _build_rate_limit_response(session_id=session_id, language=lang, session=session_for_limit)
+                limited_result = _apply_response_length_control(limited_result)
+                log_event(
+                    "conversation_service_rate_limited",
+                    endpoint="conversation_service",
+                    status="throttled",
+                    session_id=session_id,
+                    user_id=str(session_for_limit.get("user_id") or ""),
+                    limit_window_seconds=RATE_LIMIT_WINDOW_SECONDS,
+                    limit_max_requests=RATE_LIMIT_MAX_REQUESTS,
+                )
+                return limited_result
+
+            if not MVP_PIPELINE_ENABLED:
+                result = handle_conversation(session_id=session_id, user_input=user_input, language=language, debug=debug)
+            else:
+                normalized = normalize_for_intent(user_input or "", language_hint=lang)
+                cleaned_input = str(normalized.intent_text or normalized.normalized_text or normalized.raw_text or "").strip()
+                if not cleaned_input.strip():
+                    cleaned_input = str(user_input or "").strip()
+
+                safe_session = session_for_limit
+                safe_session["language"] = lang
+
+                fallback_used = False
+                intent_name = INTENT_SCHEME_QUERY
+                confidence_pct = 0.0
+                intent_debug: Dict[str, Any] = {
+                    "fallback_used": False,
+                    "source": "mvp_pipeline",
+                }
+                rag_match: Optional[Dict[str, Any]] = None
+                recommendations: List[str] = []
+
+                try:
+                    intent_result = _run_intent_with_timeout(cleaned_input)
+                    intent_name = str(intent_result.get("canonical_intent") or intent_result.get("intent") or INTENT_SCHEME_QUERY)
+                    confidence_pct = float(intent_result.get("confidence") or 0.0)
+                    if confidence_pct <= 1.0:
+                        confidence_pct = round(confidence_pct * 100.0, 2)
+                    intent_debug.update(
+                        {
+                            "confidence": confidence_pct,
+                            "normalized_intent": intent_name,
+                            "raw_model_output": intent_result.get("debug", {}).get("raw_model_output") if isinstance(intent_result.get("debug"), dict) else None,
+                        }
+                    )
+
+                    intent_confidence_pct = float(intent_result.get("confidence") or 0.0)
+                    if intent_confidence_pct <= 1.0:
+                        intent_confidence_pct = intent_confidence_pct * 100.0
+                    scheme_hint = ""
+                    if intent_confidence_pct >= 60.0:
+                        scheme_hint = str(intent_result.get("scheme") or safe_session.get("last_scheme") or "").strip()
+                    rag_match, recommendations, _ = _run_rag_with_timeout(cleaned_input, lang, scheme_hint)
+                except Exception:
+                    fallback_used = True
+                    record_fallback()
+
+                scheme_name = ""
+                response_text = ""
+                if rag_match and isinstance(rag_match, dict):
+                    scheme_name = str(rag_match.get("confirmation") or "").strip()
+                    response_text = str(rag_match.get("explanation") or rag_match.get("next_step") or "").strip()
+                    if not recommendations:
+                        recommendations = [str(item) for item in (rag_match.get("schemes") or []) if str(item).strip()]
+
+                if not response_text:
+                    fallback_text, forced_scheme = _simple_fallback_text(cleaned_input, lang)
+                    response_text = fallback_text
+                    if forced_scheme and not scheme_name:
+                        scheme_name = forced_scheme
+                    if forced_scheme and not recommendations:
+                        recommendations = [forced_scheme]
+                    fallback_used = True
+                    intent_debug["fallback_used"] = True
+                    intent_debug["fallback_reason"] = "intent_or_rag_unavailable"
+
+                safe_session["last_intent"] = intent_name
+                safe_session["last_action"] = "info"
+                if scheme_name:
+                    safe_session["last_scheme"] = scheme_name
+                    safe_session["selected_scheme"] = scheme_name
+                safe_session["_safety_fallback_triggered"] = bool(fallback_used)
+                safe_session["_safety_low_confidence"] = bool(fallback_used)
+                safe_session["_safety_ambiguous"] = False
+                update_session(session_id, safe_session)
+
+                result = _build_response(
+                    session_id=session_id,
+                    response_text=response_text,
+                    field_name=None,
+                    validation_passed=True,
+                    validation_error=None,
+                    session_complete=False,
+                    mode="info",
+                    action="info",
+                    session=safe_session,
+                    quick_actions=build_quick_actions(lang, "info", "info", scheme_name or None, False),
+                    voice_text=response_text,
+                    recommended_schemes=recommendations[:3],
+                )
+                result["primary_intent"] = intent_name
+                result["secondary_intents"] = []
+                result["intent_debug"] = intent_debug
+                result["context_applied"] = False
+                result["scheme_details"] = (
+                    build_scheme_details(
+                        INTENT_SCHEME_QUERY,
+                        {
+                            "confirmation": scheme_name,
+                            "explanation": response_text,
+                            "next_step": "",
+                        },
+                    )
+                    if scheme_name
+                    else None
+                )
+
             # Enrich session with compact semantic memory for context-aware follow-up replies.
             session = get_session(session_id)
             _update_semantic_memory(session, user_input, result, result.get("primary_intent") or "")
             update_session(session_id, session)
+            _persist_user_history_async(session_id, session, user_input, result)
+            result = _apply_response_length_control(result)
             fallback_used = bool(((result.get("intent_debug") or {}).get("fallback_used")) or False)
+            scheme_detection = result.get("scheme_detection") or (result.get("debug") or {}).get("scheme_detection") or {}
+            safety_flags = result.get("safety") or (result.get("debug") or {}).get("safety") or {}
+            rag_debug = result.get("rag_debug") or (result.get("debug") or {}).get("rag_debug") or {}
+
+            log_event(
+                "conversation_critical_events",
+                endpoint="conversation_service",
+                status="observed",
+                session_id=session_id,
+                scheme_decision=scheme_detection.get("decision"),
+                selected_scheme=scheme_detection.get("selected_scheme") or session.get("selected_scheme") or session.get("last_scheme"),
+                rag_debug=rag_debug,
+                safety=safety_flags,
+            )
             log_event(
                 "conversation_service_success",
                 endpoint="conversation_service",
                 status="success",
                 session_id=session_id,
-                user_input=(user_input or "")[:220],
+                user_input_length=len(user_input or ""),
+                user_input_fingerprint=fingerprint_text(user_input),
                 detected_intent=result.get("primary_intent"),
                 confidence=(result.get("intent_debug") or {}).get("confidence"),
                 selected_scheme=session.get("selected_scheme") or session.get("last_scheme"),
@@ -2015,8 +3603,38 @@ class ConversationService:
             )
             return result
         except Exception as exc:
-            log_event("conversation_service_failure", level="error", endpoint="conversation_service", status="failure", error_type=type(exc).__name__)
-            raise
+            log_event(
+                "conversation_service_failure",
+                level="error",
+                endpoint="conversation_service",
+                status="failure",
+                session_id=session_id,
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+            )
+            try:
+                safe_session = get_session(session_id) or create_session(session_id)
+            except Exception:
+                safe_session = create_session(session_id)
+            safe_session["_safety_fallback_triggered"] = True
+            safe_session["_safety_low_confidence"] = True
+            safe_session["_safety_ambiguous"] = False
+            safe_session["last_action"] = "safe_fallback"
+            safe_message = "Something went wrong. Please try again."
+            update_session(session_id, safe_session)
+            return _build_response(
+                session_id=session_id,
+                response_text=safe_message,
+                field_name=None,
+                validation_passed=True,
+                validation_error=None,
+                session_complete=False,
+                mode="clarify",
+                action="safe_fallback",
+                session=safe_session,
+                quick_actions=build_quick_actions("en", "clarify", "safe_fallback", safe_session.get("last_scheme"), False),
+                voice_text=safe_message,
+            )
 
     def merge_ocr(self, session: Dict[str, Any], extracted_data: Dict[str, Any]) -> Dict[str, Any]:
         log_event("conversation_service_merge_ocr_start", endpoint="conversation_service", status="success")

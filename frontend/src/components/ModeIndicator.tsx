@@ -19,8 +19,8 @@ const ModeIndicator = ({ mode }: ModeIndicatorProps) => {
         isClarify
           ? "border-amber-400/40 bg-amber-500/10 text-amber-100"
           : isInfo
-            ? "border-cyan-400/40 bg-cyan-500/10 text-cyan-100"
-            : "border-emerald-400/40 bg-emerald-500/10 text-emerald-100",
+            ? "border-white/10 bg-white/5 text-gray-200"
+            : "border-amber-400/40 bg-amber-500/10 text-amber-100",
       ].join(" ")}
     >
       <span>{label}</span>

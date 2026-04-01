@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import threading
 import time
+import os
 
 
 _LOCK = threading.RLock()
+_ANALYTICS_ENABLED = (os.getenv("ENABLE_VOICE_ANALYTICS") or "0").strip().lower() in {"1", "true", "yes"}
 _SESSION: dict[str, dict] = {}
 _GLOBAL = {
     "interruption_frequency": 0,
@@ -31,6 +33,8 @@ def _bucket(session_id: str) -> dict:
 
 
 def record_interruption(session_id: str) -> None:
+    if not _ANALYTICS_ENABLED:
+        return
     with _LOCK:
         _GLOBAL["interruption_frequency"] = int(_GLOBAL.get("interruption_frequency", 0)) + 1
         data = _bucket(session_id)
@@ -39,6 +43,8 @@ def record_interruption(session_id: str) -> None:
 
 
 def record_retry(session_id: str) -> None:
+    if not _ANALYTICS_ENABLED:
+        return
     with _LOCK:
         _GLOBAL["retry_patterns"] = int(_GLOBAL.get("retry_patterns", 0)) + 1
         data = _bucket(session_id)
@@ -47,6 +53,8 @@ def record_retry(session_id: str) -> None:
 
 
 def record_stt_signal(session_id: str, score: float) -> None:
+    if not _ANALYTICS_ENABLED:
+        return
     bounded = max(0.0, min(1.0, float(score)))
     with _LOCK:
         data = _bucket(session_id)
@@ -56,6 +64,8 @@ def record_stt_signal(session_id: str, score: float) -> None:
 
 
 def record_latency_perception(session_id: str, elapsed_ms: float) -> None:
+    if not _ANALYTICS_ENABLED:
+        return
     bounded = max(0.0, float(elapsed_ms))
     with _LOCK:
         data = _bucket(session_id)
@@ -65,6 +75,8 @@ def record_latency_perception(session_id: str, elapsed_ms: float) -> None:
 
 
 def snapshot(session_id: str | None = None) -> dict:
+    if not _ANALYTICS_ENABLED:
+        return {"global": {"interruption_frequency": 0, "retry_patterns": 0}, "sessions_tracked": 0}
     with _LOCK:
         if session_id:
             data = dict(_bucket(session_id))

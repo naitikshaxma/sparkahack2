@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import threading
 import time
+import os
 from typing import Any, Dict
 
 
 _LOCK = threading.Lock()
+_METRICS_ENABLED = (os.getenv("ENABLE_CORE_METRICS") or "0").strip().lower() in {"1", "true", "yes"}
 _START_TIME = time.time()
 _TOTAL_REQUESTS = 0
 _SUCCESS_REQUESTS = 0
@@ -22,6 +24,8 @@ _GENERIC_TIMINGS: dict[str, dict[str, float]] = {}
 
 
 def increment_counter(name: str, amount: int = 1) -> None:
+    if not _METRICS_ENABLED:
+        return
     key = (name or "").strip() or "unknown_counter"
     delta = max(0, int(amount))
     with _LOCK:
@@ -29,6 +33,8 @@ def increment_counter(name: str, amount: int = 1) -> None:
 
 
 def record_timing(name: str, value: float) -> None:
+    if not _METRICS_ENABLED:
+        return
     key = (name or "").strip() or "unknown_timing"
     try:
         numeric = max(0.0, float(value))
@@ -41,6 +47,8 @@ def record_timing(name: str, value: float) -> None:
 
 
 def record_request(*, response_time_ms: float, success: bool) -> None:
+    if not _METRICS_ENABLED:
+        return
     global _TOTAL_REQUESTS, _SUCCESS_REQUESTS, _FAILURE_REQUESTS, _TOTAL_LATENCY_MS
     with _LOCK:
         _TOTAL_REQUESTS += 1
@@ -54,6 +62,8 @@ def record_request(*, response_time_ms: float, success: bool) -> None:
 
 
 def record_error(error_type: str) -> None:
+    if not _METRICS_ENABLED:
+        return
     key = (error_type or "unknown_error").strip() or "unknown_error"
     with _LOCK:
         _ERROR_TYPES[key] = int(_ERROR_TYPES.get(key, 0)) + 1
@@ -61,6 +71,8 @@ def record_error(error_type: str) -> None:
 
 
 def record_fallback() -> None:
+    if not _METRICS_ENABLED:
+        return
     global _FALLBACK_FREQUENCY
     with _LOCK:
         _FALLBACK_FREQUENCY += 1
@@ -68,6 +80,8 @@ def record_fallback() -> None:
 
 
 def record_automation_result(*, success: bool, fallback_used: bool = False) -> None:
+    if not _METRICS_ENABLED:
+        return
     global _AUTOMATION_ATTEMPTS, _AUTOMATION_SUCCESSES, _AUTOMATION_FAILURES, _AUTOMATION_FALLBACK_USED
     with _LOCK:
         _AUTOMATION_ATTEMPTS += 1
@@ -82,6 +96,26 @@ def record_automation_result(*, success: bool, fallback_used: bool = False) -> N
 
 
 def get_metrics_snapshot() -> Dict[str, Any]:
+    if not _METRICS_ENABLED:
+        return {
+            "uptime_seconds": max(0, int(time.time() - _START_TIME)),
+            "total_requests": 0,
+            "success_requests": 0,
+            "failure_requests": 0,
+            "success_rate": 0.0,
+            "failure_rate": 0.0,
+            "error_rate": 0.0,
+            "average_latency_ms": 0.0,
+            "fallback_frequency": 0,
+            "fallback_rate": 0.0,
+            "automation_attempts": 0,
+            "automation_successes": 0,
+            "automation_failures": 0,
+            "automation_success_rate": 0.0,
+            "automation_fallback_rate": 0.0,
+            "error_types": {},
+            "counters": {},
+        }
     with _LOCK:
         total_requests = _TOTAL_REQUESTS
         success_requests = _SUCCESS_REQUESTS

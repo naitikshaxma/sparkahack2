@@ -10,8 +10,6 @@ It accepts voice or text input, transcribes speech, detects intent, retrieves re
 - `datasets/`: canonical datasets used by backend services (`schemes_dataset.json`).
 - `models/`: local model artifacts (kept out of git by default).
 - `scripts/`: utility scripts (for example, dataset generation).
-- `tests/`: local pipeline/integration tests.
-- `docs/`: project documentation assets.
 
 Request flow:
 1. Frontend sends text/audio to FastAPI endpoints.
@@ -71,7 +69,14 @@ Security notes:
 ./scripts/install_git_hooks.ps1
 ```
 
-If a secret is exposed, follow [docs/SECRET_HISTORY_CLEANUP.md](docs/SECRET_HISTORY_CLEANUP.md).
+Pre-commit quality gate:
+- Runs `ruff` lint checks.
+- Blocks the commit when lint fails.
+
+CI gate:
+- GitHub Actions workflow: `.github/workflows/ci.yml`
+- Triggered on every push and pull request.
+- Runs lint and repository checks configured in the workflow.
 
 ## API Endpoints
 
@@ -116,13 +121,6 @@ If a secret is exposed, follow [docs/SECRET_HISTORY_CLEANUP.md](docs/SECRET_HIST
   - `VITE_DEV_BACKEND_URL` (dev proxy target for Vite)
   - `VITE_DEV_PORT` (dev server port override)
 - Production template: [frontend/.env.production](frontend/.env.production)
-
-## Documentation Index
-
-- API reference: [docs/API_OVERVIEW.md](docs/API_OVERVIEW.md)
-- Architecture summary: [docs/ARCHITECTURE_SUMMARY.md](docs/ARCHITECTURE_SUMMARY.md)
-- Secret recovery runbook: [docs/SECRET_HISTORY_CLEANUP.md](docs/SECRET_HISTORY_CLEANUP.md)
-- Release checklist: [docs/RELEASE_CHECKLIST_v1.0.md](docs/RELEASE_CHECKLIST_v1.0.md)
 
 ## Release Preparation (v1.0)
 

@@ -1,9 +1,17 @@
 import { useState, useEffect } from 'react';
-import SparkleBackground from './result/SparkleBackground';
+import SparkleBackground from './SparkleBackground';
 
 const languages = [
     { native: 'हिन्दी', english: 'HINDI' },
     { native: 'English', english: 'ENGLISH' },
+    { native: 'বাংলা', english: 'BENGALI' },
+    { native: 'ਪੰਜਾਬੀ', english: 'PUNJABI' },
+    { native: 'தமிழ்', english: 'TAMIL' },
+    { native: 'తెలుగు', english: 'TELUGU' },
+    { native: 'मराठी', english: 'MARATHI' },
+    { native: 'ગુજરાતી', english: 'GUJARATI' },
+    { native: 'ಕನ್ನಡ', english: 'KANNADA' },
+    { native: 'اردو', english: 'URDU' },
 ];
 
 const INTERVAL_MS = 450;
@@ -71,7 +79,7 @@ const IntroScreen = ({ onComplete }: IntroScreenProps) => {
 
                 {/* Subtitle */}
                 <p className="intro-subtitle">
-                    Bilingual Voice Assistant for Bharat
+                    Multilingual Voice Assistant for Bharat
                 </p>
             </div>
         </div>

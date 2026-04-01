@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 from pathlib import Path
 from typing import Any, Dict
@@ -8,6 +9,7 @@ from typing import Any, Dict
 
 _METRICS_PATH = Path(__file__).resolve().parent / "intent_metrics.json"
 _LOCK = threading.Lock()
+_ANALYTICS_ENABLED = (os.getenv("ENABLE_INTENT_ANALYTICS") or "0").strip().lower() in {"1", "true", "yes"}
 _METRICS: Dict[str, Any] = {
     "intent_frequency": {},
     "fallback_frequency": 0,
@@ -31,6 +33,8 @@ def record_intent_event(
     low_confidence: bool,
     raw_intent: str = "",
 ) -> None:
+    if not _ANALYTICS_ENABLED:
+        return
     with _LOCK:
         intent_frequency = _METRICS.setdefault("intent_frequency", {})
         intent_frequency[intent] = int(intent_frequency.get(intent, 0)) + 1
@@ -51,6 +55,13 @@ def record_intent_event(
 
 
 def get_intent_metrics() -> Dict[str, Any]:
+    if not _ANALYTICS_ENABLED:
+        return {
+            "intent_frequency": {},
+            "fallback_frequency": 0,
+            "unknown_intents": {},
+            "low_confidence_cases": 0,
+        }
     with _LOCK:
         return {
             "intent_frequency": dict(_METRICS.get("intent_frequency", {})),

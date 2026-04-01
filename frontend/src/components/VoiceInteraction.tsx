@@ -1,31 +1,20 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Mic, RotateCcw, Sparkles } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Menu, Mic, RotateCcw } from "lucide-react";
 import BackButton from "./BackButton";
-import ActionCard from "./ActionCard";
-import KnowledgeCard from "./KnowledgeCard";
-import ModeIndicator from "./ModeIndicator";
-import QuickActions from "./QuickActions";
-import ConversationHistory from "./ConversationHistory";
-import OnboardingPanel from "./OnboardingPanel";
-import DebugPanel from "./DebugPanel";
+import SparkleBackground from "./SparkleBackground";
 import {
   clearSessionId,
   getOrCreateSessionId,
   interruptTts,
-  ProcessTextStreamEvent,
-  processText,
-  processTextStream,
   resetSession,
+  setSessionId,
   synthesizeTts,
 } from "@/services/api";
 import { useVoiceStore } from "@/store/voiceStore";
-import { detectTextLanguage, getFriendlyError, getGreeting } from "@/lib/languageUtils";
+import { detectTextLanguage, getGreeting } from "@/lib/languageUtils";
 import { logFrontendEvent } from "@/services/frontendTelemetry";
 import type { ConversationTurn } from "@/store/voiceStore";
 
-const SparkleBackground = import.meta.env.MODE === "test"
-  ? (() => null)
-  : lazy(() => import("./result/SparkleBackground"));
 
 interface Language {
   code: string;
@@ -39,50 +28,397 @@ interface VoiceInteractionProps {
   onBack: () => void;
 }
 
-type SpeechRecognitionLike = {
-  lang: string;
-  continuous: boolean;
-  interimResults: boolean;
-  onresult: ((event: SpeechRecognitionEventLike) => void) | null;
-  onerror: (() => void) | null;
-  onend: (() => void) | null;
-  start: () => void;
-  stop: () => void;
-};
-
-type SpeechRecognitionEventLike = {
-  resultIndex?: number;
-  results: ArrayLike<{
-    isFinal?: boolean;
-    0: { transcript: string };
-  }>;
-};
-
-const MAX_AUDIO_QUEUE = 24;
-
-function getSpeechRecognitionCtor(): (new () => SpeechRecognitionLike) | null {
-  const win = window as Window & {
-    SpeechRecognition?: new () => SpeechRecognitionLike;
-    webkitSpeechRecognition?: new () => SpeechRecognitionLike;
-  };
-  return win.SpeechRecognition || win.webkitSpeechRecognition || null;
+interface StoredConversation {
+  id: string;
+  sessionId: string;
+  title: string;
+  messages: ConversationTurn[];
+  updatedAt: number;
 }
 
+interface RoleMessage {
+  role: "user" | "assistant";
+  text: string;
+}
+
+interface RoleConversation {
+  id: string;
+  title: string;
+  messages: RoleMessage[];
+  updatedAt?: number;
+}
+
+const MAX_CONVERSATIONS = 10;
+const MAX_MESSAGES_PER_CONVERSATION = 5;
+const PHONE_STORAGE_KEY = "voice_os_user_phone";
+const ROLE_CONVERSATIONS_KEY = "voice_os_conversations";
+const ROLE_ACTIVE_CONVERSATION_KEY = "voice_os_active_conversation_id";
+const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL || "";
+const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY || "";
+const CONVERSATION_SYNC_DEBOUNCE_MS = 800;
+
+type UiCopy = {
+  appLabel: string;
+  closeMenu: string;
+  openMenu: string;
+  chats: string;
+  newChat: string;
+  noConversations: string;
+  changeLanguage: string;
+  restart: string;
+  startConversationHint: string;
+  statusListening: string;
+  statusProcessing: string;
+  statusSpeaking: string;
+  statusInterrupted: string;
+  statusIdle: string;
+  liveTranscript: string;
+  speechWillAppear: string;
+  typeHere: string;
+  send: string;
+  retry: string;
+  micControl: string;
+  textInput: string;
+  simpleError: string;
+  processingAudio: string;
+  quickApply: string;
+  quickAmount: string;
+  quickDocs: string;
+  quickApplyQuery: (scheme: string) => string;
+  quickAmountQuery: (scheme: string) => string;
+  quickDocsQuery: (scheme: string) => string;
+};
+
+const UI_COPY: Record<string, UiCopy> = {
+  en: {
+    appLabel: "Voice assistant interface",
+    closeMenu: "Close menu",
+    openMenu: "Open menu",
+    chats: "Chats",
+    newChat: "New chat",
+    noConversations: "No conversations yet",
+    changeLanguage: "Change language",
+    restart: "Restart",
+    startConversationHint: "Start a new conversation",
+    statusListening: "Listening...",
+    statusProcessing: "Processing...",
+    statusSpeaking: "Speaking...",
+    statusInterrupted: "Tap the mic to speak again",
+    statusIdle: "Tap the mic to speak",
+    liveTranscript: "Live transcript",
+    speechWillAppear: "Your speech will appear here",
+    typeHere: "Type here...",
+    send: "Send",
+    retry: "Retry",
+    micControl: "Control microphone",
+    textInput: "Text input",
+    simpleError: "I didn't catch that. Please say it again.",
+    processingAudio: "(🎤 Processing audio...)",
+    quickApply: "How to apply?",
+    quickAmount: "How much money will I get?",
+    quickDocs: "What documents are needed?",
+    quickApplyQuery: (scheme) => `How to apply for ${scheme}?`,
+    quickAmountQuery: (scheme) => `How much money will I get from ${scheme}?`,
+    quickDocsQuery: (scheme) => `What documents are needed for ${scheme}?`,
+  },
+  hi: {
+    appLabel: "वॉइस असिस्टेंट इंटरफेस",
+    closeMenu: "मेनू बंद करें",
+    openMenu: "मेनू खोलें",
+    chats: "बातचीत",
+    newChat: "नई बातचीत",
+    noConversations: "अभी कोई बातचीत नहीं",
+    changeLanguage: "भाषा बदलें",
+    restart: "रीस्टार्ट",
+    startConversationHint: "नई बात शुरू करें",
+    statusListening: "सुन रहा हूँ...",
+    statusProcessing: "समझ रहा हूँ...",
+    statusSpeaking: "बोल रहा हूँ...",
+    statusInterrupted: "माइक दबाकर फिर बोलिए",
+    statusIdle: "माइक दबाकर बोलिए",
+    liveTranscript: "लाइव ट्रांसक्रिप्ट",
+    speechWillAppear: "आपकी बात यहां दिखेगी",
+    typeHere: "यहाँ लिखें...",
+    send: "भेजें",
+    retry: "फिर से",
+    micControl: "माइक्रोफ़ोन नियंत्रित करें",
+    textInput: "टेक्स्ट इनपुट",
+    simpleError: "समझ नहीं आया, फिर से बोलिए।",
+    processingAudio: "(🎤 ऑडियो प्रोसेस हो रहा है...)",
+    quickApply: "आवेदन कैसे करें?",
+    quickAmount: "कितना पैसा मिलेगा?",
+    quickDocs: "कौन से दस्तावेज़ चाहिए?",
+    quickApplyQuery: (scheme) => `${scheme} के लिए आवेदन कैसे करें?`,
+    quickAmountQuery: (scheme) => `${scheme} से कितना पैसा मिलेगा?`,
+    quickDocsQuery: (scheme) => `${scheme} के लिए कौन से दस्तावेज़ चाहिए?`,
+  },
+  bn: {
+    appLabel: "ভয়েস সহকারী ইন্টারফেস",
+    closeMenu: "মেনু বন্ধ করুন",
+    openMenu: "মেনু খুলুন",
+    chats: "আলাপ",
+    newChat: "নতুন আলাপ",
+    noConversations: "এখনও কোনো আলাপ নেই",
+    changeLanguage: "ভাষা বদলান",
+    restart: "রিস্টার্ট",
+    startConversationHint: "নতুন করে কথা শুরু করুন",
+    statusListening: "শুনছি...",
+    statusProcessing: "বুঝছি...",
+    statusSpeaking: "বলছি...",
+    statusInterrupted: "মাইক চাপুন ও আবার বলুন",
+    statusIdle: "মাইক চাপুন ও বলুন",
+    liveTranscript: "লাইভ ট্রান্সক্রিপ্ট",
+    speechWillAppear: "আপনার কথা এখানে দেখা যাবে",
+    typeHere: "এখানে লিখুন...",
+    send: "পাঠান",
+    retry: "আবার চেষ্টা করুন",
+    micControl: "মাইক্রোফোন নিয়ন্ত্রণ করুন",
+    textInput: "টেক্সট ইনপুট",
+    simpleError: "বুঝতে পারিনি, আবার বলুন।",
+    processingAudio: "(🎤 অডিও প্রসেস হচ্ছে...)",
+    quickApply: "কীভাবে আবেদন করব?",
+    quickAmount: "কত টাকা পাব?",
+    quickDocs: "কোন নথি লাগবে?",
+    quickApplyQuery: (scheme) => `${scheme} এর জন্য কীভাবে আবেদন করব?`,
+    quickAmountQuery: (scheme) => `${scheme} থেকে কত টাকা পাব?`,
+    quickDocsQuery: (scheme) => `${scheme} এর জন্য কোন নথি লাগবে?`,
+  },
+  pa: {
+    appLabel: "ਵੌਇਸ ਸਹਾਇਕ ਇੰਟਰਫੇਸ",
+    closeMenu: "ਮੈਨੂ ਬੰਦ ਕਰੋ",
+    openMenu: "ਮੈਨੂ ਖੋਲ੍ਹੋ",
+    chats: "ਗੱਲਬਾਤ",
+    newChat: "ਨਵੀਂ ਗੱਲਬਾਤ",
+    noConversations: "ਹਾਲੇ ਕੋਈ ਗੱਲਬਾਤ ਨਹੀਂ",
+    changeLanguage: "ਭਾਸ਼ਾ ਬਦਲੋ",
+    restart: "ਰੀਸਟਾਰਟ",
+    startConversationHint: "ਨਵੀਂ ਗੱਲ ਸ਼ੁਰੂ ਕਰੋ",
+    statusListening: "ਸੁਣ ਰਿਹਾ ਹਾਂ...",
+    statusProcessing: "ਸਮਝ ਰਿਹਾ ਹਾਂ...",
+    statusSpeaking: "ਬੋਲ ਰਿਹਾ ਹਾਂ...",
+    statusInterrupted: "ਮਾਈਕ ਦਬਾਓ ਅਤੇ ਫਿਰ ਬੋਲੋ",
+    statusIdle: "ਮਾਈਕ ਦਬਾਓ ਅਤੇ ਬੋਲੋ",
+    liveTranscript: "ਲਾਈਵ ਟ੍ਰਾਂਸਕ੍ਰਿਪਟ",
+    speechWillAppear: "ਤੁਹਾਡੀ ਗੱਲ ਇੱਥੇ ਦਿਖੇਗੀ",
+    typeHere: "ਇੱਥੇ ਲਿਖੋ...",
+    send: "ਭੇਜੋ",
+    retry: "ਮੁੜ ਕੋਸ਼ਿਸ਼ ਕਰੋ",
+    micControl: "ਮਾਈਕ ਕੰਟਰੋਲ ਕਰੋ",
+    textInput: "ਟੈਕਸਟ ਇਨਪੁੱਟ",
+    simpleError: "ਸਮਝ ਨਹੀਂ ਆਇਆ, ਫਿਰ ਤੋਂ ਬੋਲੋ।",
+    processingAudio: "(🎤 ਆਡੀਓ ਪ੍ਰੋਸੈਸ ਹੋ ਰਿਹਾ ਹੈ...)",
+    quickApply: "ਅਰਜ਼ੀ ਕਿਵੇਂ ਕਰੀਏ?",
+    quickAmount: "ਕਿੰਨਾ ਪੈਸਾ ਮਿਲੇਗਾ?",
+    quickDocs: "ਕਿਹੜੇ ਦਸਤਾਵੇਜ਼ ਚਾਹੀਦੇ ਹਨ?",
+    quickApplyQuery: (scheme) => `${scheme} ਲਈ ਅਰਜ਼ੀ ਕਿਵੇਂ ਕਰੀਏ?`,
+    quickAmountQuery: (scheme) => `${scheme} ਤੋਂ ਕਿੰਨਾ ਪੈਸਾ ਮਿਲੇਗਾ?`,
+    quickDocsQuery: (scheme) => `${scheme} ਲਈ ਕਿਹੜੇ ਦਸਤਾਵੇਜ਼ ਚਾਹੀਦੇ ਹਨ?`,
+  },
+  ta: {
+    appLabel: "குரல் உதவி இடைமுகம்",
+    closeMenu: "மெனுவை மூடு",
+    openMenu: "மெனுவை திற",
+    chats: "உரையாடல்கள்",
+    newChat: "புதிய உரையாடல்",
+    noConversations: "இன்னும் உரையாடல்கள் இல்லை",
+    changeLanguage: "மொழியை மாற்று",
+    restart: "மறுதொடங்கு",
+    startConversationHint: "புதிய உரையாடலை தொடங்கு",
+    statusListening: "கேட்கிறேன்...",
+    statusProcessing: "புரிந்துகொள்கிறேன்...",
+    statusSpeaking: "பேசுகிறேன்...",
+    statusInterrupted: "மைக் அழுத்தி மீண்டும் பேசுங்கள்",
+    statusIdle: "மைக் அழுத்தி பேசுங்கள்",
+    liveTranscript: "நேரடி உரை",
+    speechWillAppear: "உங்கள் பேச்சு இங்கே காணப்படும்",
+    typeHere: "இங்கே எழுதுங்கள்...",
+    send: "அனுப்பு",
+    retry: "மீண்டும் முயலவும்",
+    micControl: "மைக்ரோஃபோனை கட்டுப்படுத்து",
+    textInput: "உரை உள்ளீடு",
+    simpleError: "புரியவில்லை, மீண்டும் சொல்லுங்கள்.",
+    processingAudio: "(🎤 ஆடியோ செயலாக்கப்படுகிறது...)",
+    quickApply: "எப்படி விண்ணப்பிக்கலாம்?",
+    quickAmount: "எவ்வளவு பணம் கிடைக்கும்?",
+    quickDocs: "எந்த ஆவணங்கள் தேவை?",
+    quickApplyQuery: (scheme) => `${scheme} க்கு எப்படி விண்ணப்பிக்கலாம்?`,
+    quickAmountQuery: (scheme) => `${scheme} மூலம் எவ்வளவு பணம் கிடைக்கும்?`,
+    quickDocsQuery: (scheme) => `${scheme} க்கு எந்த ஆவணங்கள் தேவை?`,
+  },
+  te: {
+    appLabel: "వాయిస్ సహాయక ఇంటర్‌ఫేస్",
+    closeMenu: "మెనూ మూసండి",
+    openMenu: "మెనూ తెరవండి",
+    chats: "సంభాషణలు",
+    newChat: "కొత్త సంభాషణ",
+    noConversations: "ఇంకా సంభాషణలు లేవు",
+    changeLanguage: "భాష మార్చండి",
+    restart: "రీస్టార్ట్",
+    startConversationHint: "కొత్త సంభాషణ ప్రారంభించండి",
+    statusListening: "వింటున్నాను...",
+    statusProcessing: "అర్థం చేసుకుంటున్నాను...",
+    statusSpeaking: "మాట్లాడుతున్నాను...",
+    statusInterrupted: "మైక్ నొక్కి మళ్లీ మాట్లాడండి",
+    statusIdle: "మైక్ నొక్కి మాట్లాడండి",
+    liveTranscript: "లైవ్ ట్రాన్స్క్రిప్ట్",
+    speechWillAppear: "మీ మాట ఇక్కడ కనిపిస్తుంది",
+    typeHere: "ఇక్కడ టైప్ చేయండి...",
+    send: "పంపండి",
+    retry: "మళ్లీ ప్రయత్నించండి",
+    micControl: "మైక్రోఫోన్ నియంత్రణ",
+    textInput: "టెక్స్ట్ ఇన్‌పుట్",
+    simpleError: "అర్థం కాలేదు, మళ్లీ చెప్పండి.",
+    processingAudio: "(🎤 ఆడియో ప్రాసెస్ అవుతోంది...)",
+    quickApply: "ఎలా దరఖాస్తు చేయాలి?",
+    quickAmount: "ఎంత డబ్బు వస్తుంది?",
+    quickDocs: "ఏ పత్రాలు కావాలి?",
+    quickApplyQuery: (scheme) => `${scheme} కోసం ఎలా దరఖాస్తు చేయాలి?`,
+    quickAmountQuery: (scheme) => `${scheme} నుంచి ఎంత డబ్బు వస్తుంది?`,
+    quickDocsQuery: (scheme) => `${scheme} కోసం ఏ పత్రాలు కావాలి?`,
+  },
+  mr: {
+    appLabel: "व्हॉइस सहाय्यक इंटरफेस",
+    closeMenu: "मेनू बंद करा",
+    openMenu: "मेनू उघडा",
+    chats: "संभाषणे",
+    newChat: "नवीन संभाषण",
+    noConversations: "अजून संभाषणे नाहीत",
+    changeLanguage: "भाषा बदला",
+    restart: "रीस्टार्ट",
+    startConversationHint: "नवीन संभाषण सुरू करा",
+    statusListening: "ऐकत आहे...",
+    statusProcessing: "समजून घेत आहे...",
+    statusSpeaking: "बोलत आहे...",
+    statusInterrupted: "माइक दाबून पुन्हा बोला",
+    statusIdle: "माइक दाबून बोला",
+    liveTranscript: "लाइव्ह ट्रान्सक्रिप्ट",
+    speechWillAppear: "तुमचे बोलणे इथे दिसेल",
+    typeHere: "इथे लिहा...",
+    send: "पाठवा",
+    retry: "पुन्हा प्रयत्न करा",
+    micControl: "मायक्रोफोन नियंत्रित करा",
+    textInput: "टेक्स्ट इनपुट",
+    simpleError: "समजले नाही, पुन्हा बोला.",
+    processingAudio: "(🎤 ऑडिओ प्रक्रिया होत आहे...)",
+    quickApply: "अर्ज कसा करायचा?",
+    quickAmount: "किती पैसे मिळतील?",
+    quickDocs: "कोणती कागदपत्रे लागतील?",
+    quickApplyQuery: (scheme) => `${scheme} साठी अर्ज कसा करायचा?`,
+    quickAmountQuery: (scheme) => `${scheme} मधून किती पैसे मिळतील?`,
+    quickDocsQuery: (scheme) => `${scheme} साठी कोणती कागदपत्रे लागतील?`,
+  },
+  gu: {
+    appLabel: "વોઇસ સહાયક ઇન્ટરફેસ",
+    closeMenu: "મેનુ બંધ કરો",
+    openMenu: "મેનુ ખોલો",
+    chats: "વાતચીત",
+    newChat: "નવી વાતચીત",
+    noConversations: "હજુ વાતચીત નથી",
+    changeLanguage: "ભાષા બદલો",
+    restart: "રીસ્ટાર્ટ",
+    startConversationHint: "નવી વાતચીત શરૂ કરો",
+    statusListening: "સાંભળી રહ્યો છું...",
+    statusProcessing: "સમજી રહ્યો છું...",
+    statusSpeaking: "બોલી રહ્યો છું...",
+    statusInterrupted: "માઇક દબાવીને ફરી બોલો",
+    statusIdle: "માઇક દબાવીને બોલો",
+    liveTranscript: "લાઇવ ટ્રાન્સક્રિપ્ટ",
+    speechWillAppear: "તમારી વાત અહીં દેખાશે",
+    typeHere: "અહીં લખો...",
+    send: "મોકલો",
+    retry: "ફરી પ્રયાસ કરો",
+    micControl: "માઇક્રોફોન નિયંત્રિત કરો",
+    textInput: "ટેક્સ્ટ ઇનપુટ",
+    simpleError: "સમજાયું નથી, ફરી બોલો.",
+    processingAudio: "(🎤 ઓડિઓ પ્રક્રિયા થઈ રહી છે...)",
+    quickApply: "અરજી કેવી રીતે કરવી?",
+    quickAmount: "કેટલા પૈસા મળશે?",
+    quickDocs: "કયા દસ્તાવેજો જોઈએ?",
+    quickApplyQuery: (scheme) => `${scheme} માટે અરજી કેવી રીતે કરવી?`,
+    quickAmountQuery: (scheme) => `${scheme}માંથી કેટલા પૈસા મળશે?`,
+    quickDocsQuery: (scheme) => `${scheme} માટે કયા દસ્તાવેજો જોઈએ?`,
+  },
+  kn: {
+    appLabel: "ಧ್ವನಿ ಸಹಾಯಕ ಇಂಟರ್‌ಫೇಸ್",
+    closeMenu: "ಮೆನು ಮುಚ್ಚಿ",
+    openMenu: "ಮೆನು ತೆರೆಯಿ",
+    chats: "ಸಂಭಾಷಣೆಗಳು",
+    newChat: "ಹೊಸ ಸಂಭಾಷಣೆ",
+    noConversations: "ಇನ್ನೂ ಸಂಭಾಷಣೆಗಳು ಇಲ್ಲ",
+    changeLanguage: "ಭಾಷೆ ಬದಲಿಸಿ",
+    restart: "ರೀಸ್ಟಾರ್ಟ್",
+    startConversationHint: "ಹೊಸ ಸಂಭಾಷಣೆಯನ್ನು ಆರಂಭಿಸಿ",
+    statusListening: "ಕೇಳುತ್ತಿದ್ದೇನೆ...",
+    statusProcessing: "ಅರ್ಥಮಾಡಿಕೊಳ್ಳುತ್ತಿದ್ದೇನೆ...",
+    statusSpeaking: "ಮಾತನಾಡುತ್ತಿದ್ದೇನೆ...",
+    statusInterrupted: "ಮೈಕ್ ಒತ್ತಿ ಮತ್ತೆ ಮಾತನಾಡಿ",
+    statusIdle: "ಮೈಕ್ ಒತ್ತಿ ಮಾತನಾಡಿ",
+    liveTranscript: "ಲೈವ್ ಟ್ರಾನ್ಸ್‌ಕ್ರಿಪ್ಟ್",
+    speechWillAppear: "ನಿಮ್ಮ ಮಾತು ಇಲ್ಲಿ ಕಾಣಿಸುತ್ತದೆ",
+    typeHere: "ಇಲ್ಲಿ ಬರೆಯಿರಿ...",
+    send: "ಕಳುಹಿಸಿ",
+    retry: "ಮತ್ತೆ ಪ್ರಯತ್ನಿಸಿ",
+    micControl: "ಮೈಕ್ರೋಫೋನ್ ನಿಯಂತ್ರಿಸಿ",
+    textInput: "ಪಠ್ಯ ಇನ್‌ಪುಟ್",
+    simpleError: "ಅರ್ಥವಾಗಲಿಲ್ಲ, ಮತ್ತೆ ಹೇಳಿ.",
+    processingAudio: "(🎤 ಆಡಿಯೋ ಪ್ರಕ್ರಿಯೆಯಲ್ಲಿದೆ...)",
+    quickApply: "ಅರ್ಜಿಯನ್ನು ಹೇಗೆ ಸಲ್ಲಿಸಬೇಕು?",
+    quickAmount: "ಎಷ್ಟು ಹಣ ಸಿಗುತ್ತದೆ?",
+    quickDocs: "ಯಾವ ದಾಖಲೆಗಳು ಬೇಕು?",
+    quickApplyQuery: (scheme) => `${scheme}ಗಾಗಿ ಅರ್ಜಿ ಹೇಗೆ ಸಲ್ಲಿಸಬೇಕು?`,
+    quickAmountQuery: (scheme) => `${scheme}ರಿಂದ ಎಷ್ಟು ಹಣ ಸಿಗುತ್ತದೆ?`,
+    quickDocsQuery: (scheme) => `${scheme}ಗಾಗಿ ಯಾವ ದಾಖಲೆಗಳು ಬೇಕು?`,
+  },
+  ur: {
+    appLabel: "وائس اسسٹنٹ انٹرفیس",
+    closeMenu: "مینو بند کریں",
+    openMenu: "مینو کھولیں",
+    chats: "گفتگو",
+    newChat: "نئی گفتگو",
+    noConversations: "ابھی کوئی گفتگو نہیں",
+    changeLanguage: "زبان تبدیل کریں",
+    restart: "ری اسٹارٹ",
+    startConversationHint: "نئی گفتگو شروع کریں",
+    statusListening: "سن رہا ہوں...",
+    statusProcessing: "سمجھ رہا ہوں...",
+    statusSpeaking: "بول رہا ہوں...",
+    statusInterrupted: "مائیک دبا کر دوبارہ بولیں",
+    statusIdle: "مائیک دبا کر بولیں",
+    liveTranscript: "لائیو ٹرانسکرپٹ",
+    speechWillAppear: "آپ کی بات یہاں نظر آئے گی",
+    typeHere: "یہاں لکھیں...",
+    send: "بھیجیں",
+    retry: "دوبارہ کوشش کریں",
+    micControl: "مائیکروفون کنٹرول کریں",
+    textInput: "متن ان پٹ",
+    simpleError: "سمجھ نہیں آیا، دوبارہ بولیں۔",
+    processingAudio: "(🎤 آڈیو پروسیس ہو رہا ہے...)",
+    quickApply: "درخواست کیسے کریں؟",
+    quickAmount: "کتنے پیسے ملیں گے؟",
+    quickDocs: "کون سے دستاویزات چاہئیں؟",
+    quickApplyQuery: (scheme) => `${scheme} کے لیے درخواست کیسے کریں؟`,
+    quickAmountQuery: (scheme) => `${scheme} سے کتنے پیسے ملیں گے؟`,
+    quickDocsQuery: (scheme) => `${scheme} کے لیے کون سے دستاویزات چاہئیں؟`,
+  },
+};
+
+const getUiCopy = (language: string): UiCopy => UI_COPY[language] || UI_COPY.en;
+
 const VoiceInteraction = ({ language, onBack }: VoiceInteractionProps) => {
-  const selectedLanguage = localStorage.getItem("language") || language.code || "en";
-  const uiLanguage = selectedLanguage === "hi" ? "hi" : "en";
+  const selectedLanguage = localStorage.getItem("voice_os_language") || localStorage.getItem("language") || language.code || "en";
+  const uiLanguage = selectedLanguage || "en";
+  const voiceLanguage = uiLanguage;
+  const backendLanguage: "hi" | "en" = voiceLanguage === "hi" ? "hi" : "en";
+  const copy = useMemo(() => getUiCopy(uiLanguage), [uiLanguage]);
 
   const state = useVoiceStore((s) => s.voiceState);
-  const transcriptLive = useVoiceStore((s) => s.transcriptLive);
   const transcriptFinal = useVoiceStore((s) => s.transcriptFinal);
   const assistantText = useVoiceStore((s) => s.responseText);
-  const responseStream = useVoiceStore((s) => s.responseStream);
-  const response = useVoiceStore((s) => s.backendResponse);
+  const backendResponse = useVoiceStore((s) => s.backendResponse);
   const errorState = useVoiceStore((s) => s.errorState);
-  const detectedLanguage = useVoiceStore((s) => s.detectedLanguage);
   const latency = useVoiceStore((s) => s.latency);
-  const demoMode = useVoiceStore((s) => s.demoMode);
   const conversationHistory = useVoiceStore((s) => s.conversationHistory);
+  const liveTranscript = useVoiceStore((s) => s.transcriptLive);
 
   const setVoiceState = useVoiceStore((s) => s.setVoiceState);
   const setLanguage = useVoiceStore((s) => s.setLanguage);
@@ -90,211 +426,589 @@ const VoiceInteraction = ({ language, onBack }: VoiceInteractionProps) => {
   const setLiveTranscript = useVoiceStore((s) => s.setLiveTranscript);
   const setFinalTranscript = useVoiceStore((s) => s.setFinalTranscript);
   const setResponseText = useVoiceStore((s) => s.setResponseText);
-  const appendResponseStream = useVoiceStore((s) => s.appendResponseStream);
   const clearResponseStream = useVoiceStore((s) => s.clearResponseStream);
   const setStreamDone = useVoiceStore((s) => s.setStreamDone);
   const setBackendResponse = useVoiceStore((s) => s.setBackendResponse);
   const setErrorState = useVoiceStore((s) => s.setErrorState);
   const beginLatencyTracking = useVoiceStore((s) => s.beginLatencyTracking);
   const markFirstResponse = useVoiceStore((s) => s.markFirstResponse);
-  const markFirstAudioChunk = useVoiceStore((s) => s.markFirstAudioChunk);
   const endLatencyTracking = useVoiceStore((s) => s.endLatencyTracking);
-  const setRequestId = useVoiceStore((s) => s.setRequestId);
-  const setDemoMode = useVoiceStore((s) => s.setDemoMode);
   const addConversationTurn = useVoiceStore((s) => s.addConversationTurn);
   const updateConversationAssistantText = useVoiceStore((s) => s.updateConversationAssistantText);
   const replaceConversationHistory = useVoiceStore((s) => s.replaceConversationHistory);
   const clearConversationHistory = useVoiceStore((s) => s.clearConversationHistory);
   const resetConversationState = useVoiceStore((s) => s.resetConversationState);
 
-  const [micPulseKey, setMicPulseKey] = useState(0);
   const [textFallback, setTextFallback] = useState("");
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [conversations, setConversations] = useState<StoredConversation[]>([]);
+  const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
+  const [roleConversations, setRoleConversations] = useState<RoleConversation[]>([]);
+  const [isRecording, setIsRecording] = useState(false);
 
-  const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
+  const phoneId = useMemo(() => localStorage.getItem(PHONE_STORAGE_KEY) || "guest", []);
+  const conversationsStorageKey = useMemo(() => `voice_conversations_${phoneId}`, [phoneId]);
+
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const mediaChunksRef = useRef<BlobPart[]>([]);
+  const silenceTimerRef = useRef<number | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
-  const audioQueueRef = useRef<Array<{ audio: string; text: string }>>([]);
-  const drainingQueueRef = useRef(false);
   const hasPlayedGreetingRef = useRef(false);
   const requestCounterRef = useRef(0);
-  const playbackCounterRef = useRef(0);
   const processingRef = useRef(false);
   const lastTranscriptRef = useRef<{ text: string; ts: number }>({ text: "", ts: 0 });
-  const typingQueueRef = useRef<string[]>([]);
-  const typingTimerRef = useRef<number | null>(null);
   const activeTurnIdRef = useRef<string | null>(null);
-  const streamAbortRef = useRef<AbortController | null>(null);
+  const chatEndRef = useRef<HTMLDivElement | null>(null);
+  const syncTimerRef = useRef<number | null>(null);
 
-  const quickPrompts = useMemo(() => {
-    if (demoMode) {
-      return uiLanguage === "hi"
-        ? [
-          "मुझे PM Kisan की जानकारी चाहिए",
-          "आवेदन शुरू करें",
-          "मेरी एप्लिकेशन स्टेटस बताइए",
-        ]
-        : [
-          "I need PM Kisan information",
-          "Start application",
-          "Check my application status",
-        ];
+  const getConversationTitle = useCallback((messages: ConversationTurn[]) => {
+    const firstUser = messages.find((message) => message.userText && message.userText.trim());
+    if (!firstUser) {
+      return "";
     }
-
-    return uiLanguage === "hi"
-      ? ["Loan apply karna hai", "PM Kisan kya hai", "Pension scheme"]
-      : ["I want to apply for a loan", "What is PM Kisan?", "Tell me pension scheme"];
-  }, [demoMode, uiLanguage]);
-
-  useEffect(() => {
-    const sessionId = getOrCreateSessionId();
-    const key = `voice_history_${sessionId}`;
-    const raw = localStorage.getItem(key);
-    if (!raw) {
-      replaceConversationHistory([]);
-      return;
+    const normalized = firstUser.userText.replace(/\s+/g, " ").trim();
+    if (!normalized) {
+      return "";
     }
-
-    try {
-      const parsed = JSON.parse(raw) as ConversationTurn[];
-      if (Array.isArray(parsed)) {
-        replaceConversationHistory(parsed.slice(-30));
-      }
-    } catch {
-      replaceConversationHistory([]);
+    if (normalized.length > 32) {
+      return `${normalized.slice(0, 32).trim()}...`;
     }
-  }, [replaceConversationHistory]);
-
-  useEffect(() => {
-    const sessionId = getOrCreateSessionId();
-    const key = `voice_history_${sessionId}`;
-    localStorage.setItem(key, JSON.stringify(conversationHistory.slice(-30)));
-  }, [conversationHistory]);
-
-  const stopTyping = useCallback(() => {
-    typingQueueRef.current = [];
-    if (typingTimerRef.current !== null) {
-      window.clearInterval(typingTimerRef.current);
-      typingTimerRef.current = null;
-    }
+    return normalized;
   }, []);
 
-  const enqueueTyping = useCallback(
-    (segment: string) => {
-      const words = (segment || "").trim().split(/\s+/).filter(Boolean);
-      if (words.length === 0) {
+  const syncConversationsToSupabase = useCallback(
+    (payload: StoredConversation[]) => {
+      if (!SUPABASE_URL || !SUPABASE_ANON_KEY || !phoneId || phoneId === "guest") {
         return;
       }
+      const endpoint = `${SUPABASE_URL}/rest/v1/voice_conversations?on_conflict=user_id`;
+      const body = JSON.stringify([
+        {
+          user_id: phoneId,
+          payload: { conversations: payload },
+          updated_at: new Date().toISOString(),
+        },
+      ]);
 
-      typingQueueRef.current.push(...words);
-      if (typingTimerRef.current !== null) {
-        return;
-      }
-
-      typingTimerRef.current = window.setInterval(() => {
-        const nextWord = typingQueueRef.current.shift();
-        if (!nextWord) {
-          if (typingTimerRef.current !== null) {
-            window.clearInterval(typingTimerRef.current);
-            typingTimerRef.current = null;
-          }
-          return;
-        }
-        appendResponseStream(nextWord);
-      }, 70);
+      fetch(endpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          apikey: SUPABASE_ANON_KEY,
+          Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+          Prefer: "resolution=merge-duplicates",
+        },
+        body,
+      }).catch(() => undefined);
     },
-    [appendResponseStream],
+    [phoneId],
   );
 
+  const scheduleSupabaseSync = useCallback(
+    (payload: StoredConversation[]) => {
+      if (syncTimerRef.current !== null) {
+        window.clearTimeout(syncTimerRef.current);
+      }
+      syncTimerRef.current = window.setTimeout(() => {
+        syncTimerRef.current = null;
+        syncConversationsToSupabase(payload);
+      }, CONVERSATION_SYNC_DEBOUNCE_MS);
+    },
+    [syncConversationsToSupabase],
+  );
+
+  const sanitizeConversationMessages = useCallback(
+    (messages: ConversationTurn[]) => messages.slice(-MAX_MESSAGES_PER_CONVERSATION),
+    [],
+  );
+
+  const sanitizeRoleMessages = useCallback((messages: unknown): RoleMessage[] => {
+    if (!Array.isArray(messages)) {
+      return [];
+    }
+    return messages
+      .filter((message) =>
+        Boolean(message)
+        && typeof (message as RoleMessage).text === "string"
+        && ((message as RoleMessage).role === "user" || (message as RoleMessage).role === "assistant"),
+      )
+      .map((message) => ({
+        role: (message as RoleMessage).role,
+        text: (message as RoleMessage).text,
+      }))
+      .filter((message) => message.text.trim().length > 0)
+      .slice(-MAX_MESSAGES_PER_CONVERSATION);
+  }, []);
+
+  const buildRoleMessagesFromTurns = useCallback((messages: ConversationTurn[]) => {
+    const roleMessages: RoleMessage[] = [];
+    messages.forEach((turn) => {
+      if (turn.userText) {
+        roleMessages.push({ role: "user", text: turn.userText });
+      }
+      if (turn.assistantText) {
+        roleMessages.push({ role: "assistant", text: turn.assistantText });
+      }
+    });
+    return roleMessages.slice(-MAX_MESSAGES_PER_CONVERSATION);
+  }, []);
+
+  const buildTurnsFromRoleMessages = useCallback(
+    (messages: RoleMessage[] | unknown) => {
+      const turns: ConversationTurn[] = [];
+      const sanitizedMessages = sanitizeRoleMessages(messages);
+      let currentTurn: ConversationTurn | null = null;
+
+      sanitizedMessages.forEach((message, index) => {
+        if (message.role === "user") {
+          if (currentTurn) {
+            turns.push(currentTurn);
+          }
+          currentTurn = {
+            id: `turn-${Date.now()}-${index}`,
+            userText: message.text,
+            assistantText: "",
+            language: backendLanguage,
+            createdAt: Date.now(),
+          };
+          return;
+        }
+
+        if (!currentTurn) {
+          currentTurn = {
+            id: `turn-${Date.now()}-${index}`,
+            userText: "",
+            assistantText: message.text,
+            language: backendLanguage,
+            createdAt: Date.now(),
+          };
+          if (currentTurn) {
+            turns.push(currentTurn);
+          }
+          currentTurn = null;
+          return;
+        }
+
+        currentTurn.assistantText = message.text;
+        turns.push(currentTurn);
+        currentTurn = null;
+      });
+
+      if (currentTurn) {
+        turns.push(currentTurn);
+      }
+
+      return sanitizeConversationMessages(turns);
+    },
+    [backendLanguage, sanitizeConversationMessages, sanitizeRoleMessages],
+  );
+
+  const getRoleConversationTitle = useCallback((messages: RoleMessage[] | unknown) => {
+    const sanitizedMessages = sanitizeRoleMessages(messages);
+    const firstUser = sanitizedMessages.find((message) => message.role === "user" && message.text.trim());
+    if (!firstUser) {
+      return "";
+    }
+    return firstUser.text.trim().slice(0, 20);
+  }, [sanitizeRoleMessages]);
+
+  const setSimpleError = useCallback(() => {
+    setErrorState(copy.simpleError);
+  }, [copy.simpleError, setErrorState]);
+
+  const ensureActiveConversationId = useCallback(() => {
+    if (activeConversationId) {
+      return activeConversationId;
+    }
+    const sessionId = `${Date.now()}`;
+    setSessionId(sessionId);
+    setActiveConversationId(sessionId);
+    localStorage.setItem(ROLE_ACTIVE_CONVERSATION_KEY, sessionId);
+    return sessionId;
+  }, [activeConversationId, setActiveConversationId, setSessionId]);
+
   const stopListening = useCallback(() => {
-    const recognition = recognitionRef.current;
-    if (!recognition) {
-      return;
+    if (silenceTimerRef.current !== null) {
+      window.clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
+    }
+    setIsRecording(false);
+
+    const recorder = mediaRecorderRef.current;
+    if (recorder) {
+      if (recorder.state !== "inactive") {
+        try {
+          recorder.stop();
+        } catch {
+          // no-op
+        }
+      }
+      mediaRecorderRef.current = null;
     }
 
-    recognition.onresult = null;
-    recognition.onerror = null;
-    recognition.onend = null;
-    try {
-      recognition.stop();
-    } catch {
-      // no-op
+    if (mediaStreamRef.current) {
+      try {
+        mediaStreamRef.current.getTracks().forEach((track) => track.stop());
+      } catch {
+        // no-op
+      }
+      mediaStreamRef.current = null;
     }
-    recognitionRef.current = null;
+
+    mediaChunksRef.current = [];
   }, []);
 
   const stopAudio = useCallback(() => {
-    playbackCounterRef.current += 1;
-    audioQueueRef.current = [];
-    drainingQueueRef.current = false;
-    stopTyping();
     if (!audioRef.current) return;
     try {
       audioRef.current.pause();
       audioRef.current.currentTime = 0;
+      audioRef.current.removeAttribute("src");
+      audioRef.current.load();
     } catch {
       // no-op
     }
-    audioRef.current = null;
-  }, [stopTyping]);
-
-  const abortActiveStream = useCallback(() => {
-    if (streamAbortRef.current) {
-      streamAbortRef.current.abort();
-      streamAbortRef.current = null;
-    }
   }, []);
+
+  const loadConversationIntoUi = useCallback(
+    (conversation: StoredConversation) => {
+      const sessionId = conversation.sessionId || conversation.id;
+      stopListening();
+      stopAudio();
+      setActiveConversationId(conversation.id);
+      replaceConversationHistory(sanitizeConversationMessages(conversation.messages || []));
+
+      const lastAssistant = [...(conversation.messages || [])]
+        .reverse()
+        .find((message) => message.assistantText && message.assistantText.trim())?.assistantText;
+      if (lastAssistant) {
+        setResponseText(lastAssistant);
+      } else {
+        setResponseText(getGreeting(backendLanguage));
+      }
+
+      setLiveTranscript("");
+      setFinalTranscript("");
+      clearResponseStream();
+      setStreamDone(false);
+      setErrorState(null);
+      setVoiceState("idle");
+      setTextFallback("");
+      setSessionId(sessionId);
+    },
+    [
+      clearResponseStream,
+      replaceConversationHistory,
+      sanitizeConversationMessages,
+      setErrorState,
+      setFinalTranscript,
+      setLiveTranscript,
+      setResponseText,
+      setSessionId,
+      setStreamDone,
+      setVoiceState,
+      stopAudio,
+      stopListening,
+      voiceLanguage,
+    ],
+  );
+
+  const handleSelectConversation = useCallback(
+    (conversationId: string) => {
+      const stored = roleConversations.find((item) => item.id === conversationId);
+      const conversation: StoredConversation = {
+        id: conversationId,
+        sessionId: conversationId,
+        title: stored?.title || "",
+        messages: stored ? buildTurnsFromRoleMessages(stored.messages) : [],
+        updatedAt: stored?.updatedAt || Date.now(),
+      };
+      localStorage.setItem(ROLE_ACTIVE_CONVERSATION_KEY, conversationId);
+      setSidebarOpen(false);
+      loadConversationIntoUi(conversation);
+    },
+    [buildTurnsFromRoleMessages, loadConversationIntoUi, roleConversations],
+  );
+
+  const handleNewChat = useCallback(() => {
+    stopListening();
+    stopAudio();
+    requestCounterRef.current += 1;
+    processingRef.current = false;
+    lastTranscriptRef.current = { text: "", ts: 0 };
+
+    const newId = `${Date.now()}`;
+    localStorage.setItem(ROLE_ACTIVE_CONVERSATION_KEY, newId);
+    const emptyConversation: StoredConversation = {
+      id: newId,
+      sessionId: newId,
+      title: "",
+      messages: [],
+      updatedAt: Date.now(),
+    };
+    setSidebarOpen(false);
+    loadConversationIntoUi(emptyConversation);
+  }, [loadConversationIntoUi, stopAudio, stopListening]);
+
+  const parseStoredConversations = useCallback(
+    (raw: string) => {
+      try {
+        const parsed = JSON.parse(raw) as StoredConversation[];
+        if (!Array.isArray(parsed)) {
+          return [];
+        }
+        const sanitized = parsed.map((item) => {
+          const messages = sanitizeConversationMessages(Array.isArray(item.messages) ? item.messages : []);
+          const sessionId = typeof item.sessionId === "string" && item.sessionId ? item.sessionId : item.id;
+          const id = typeof item.id === "string" && item.id ? item.id : sessionId;
+          const title = typeof item.title === "string" && item.title ? item.title : getConversationTitle(messages);
+          const updatedAt = typeof item.updatedAt === "number" ? item.updatedAt : Date.now();
+          return {
+            id,
+            sessionId,
+            title,
+            messages,
+            updatedAt,
+          };
+        });
+        return [...sanitized].sort((a, b) => b.updatedAt - a.updatedAt).slice(0, MAX_CONVERSATIONS);
+      } catch {
+        return [];
+      }
+    },
+    [getConversationTitle, sanitizeConversationMessages],
+  );
+
+  useEffect(() => {
+    const roleRaw = localStorage.getItem(ROLE_CONVERSATIONS_KEY);
+    let parsedRoleConversations: RoleConversation[] = [];
+    if (roleRaw) {
+      try {
+        const parsed = JSON.parse(roleRaw);
+        parsedRoleConversations = Array.isArray(parsed) ? (parsed as RoleConversation[]) : [];
+      } catch {
+        parsedRoleConversations = [];
+      }
+    }
+
+    if (parsedRoleConversations.length > 0) {
+      const mapped = parsedRoleConversations
+        .map((item, index) => {
+          if (!item || typeof item.id !== "string") {
+            return null;
+          }
+          const roleMessages = sanitizeRoleMessages(item.messages);
+          if (roleMessages.length === 0) {
+            return null;
+          }
+          const updatedAt = typeof item.updatedAt === "number" ? item.updatedAt : Date.now();
+          return {
+            id: item.id,
+            sessionId: item.id,
+            title: item.title || getRoleConversationTitle(item.messages),
+            messages: buildTurnsFromRoleMessages(item.messages),
+            updatedAt,
+            order: index,
+          };
+        })
+        .filter((item): item is StoredConversation & { order: number } => Boolean(item));
+
+      const ordered = [...mapped]
+        .sort((a, b) => (b.updatedAt - a.updatedAt) || (a.order - b.order))
+        .slice(0, MAX_CONVERSATIONS)
+        .map(({ order, ...rest }) => rest);
+
+      if (ordered.length > 0) {
+        const orderedRole = ordered.map((item) => ({
+          id: item.id,
+          title: item.title,
+          messages: buildRoleMessagesFromTurns(item.messages),
+          updatedAt: item.updatedAt,
+        }));
+        setRoleConversations(orderedRole);
+        const storedActive = localStorage.getItem(ROLE_ACTIVE_CONVERSATION_KEY);
+        const resolvedActive = storedActive
+          ? ordered.find((item) => item.id === storedActive) || ordered[0]
+          : ordered[0];
+        if (resolvedActive?.id && (!storedActive || resolvedActive.id !== storedActive)) {
+          localStorage.setItem(ROLE_ACTIVE_CONVERSATION_KEY, resolvedActive.id);
+        }
+        setConversations(ordered);
+        if (resolvedActive) {
+          loadConversationIntoUi(resolvedActive);
+        }
+        return;
+      }
+
+      setRoleConversations([]);
+      setConversations([]);
+    }
+
+    const raw = localStorage.getItem(conversationsStorageKey);
+    if (raw) {
+      const parsed = parseStoredConversations(raw);
+      if (parsed.length > 0) {
+        setConversations(parsed);
+        const roleSeed = parsed
+          .map((item) => ({
+            id: item.id,
+            title: item.title,
+            messages: buildRoleMessagesFromTurns(item.messages),
+            updatedAt: item.updatedAt,
+          }))
+          .filter((item) => item.messages.length > 0)
+          .slice(0, MAX_CONVERSATIONS);
+        setRoleConversations(roleSeed);
+        loadConversationIntoUi(parsed[0]);
+        return;
+      }
+    }
+
+    const sessionId = getOrCreateSessionId();
+    const legacyKey = `voice_history_${sessionId}`;
+    const legacyRaw = localStorage.getItem(legacyKey);
+    let legacyMessages: ConversationTurn[] = [];
+    if (legacyRaw) {
+      try {
+        const parsed = JSON.parse(legacyRaw) as ConversationTurn[];
+        if (Array.isArray(parsed)) {
+          legacyMessages = parsed;
+        }
+      } catch {
+        legacyMessages = [];
+      }
+    }
+
+    const seedMessages = sanitizeConversationMessages(legacyMessages);
+    if (seedMessages.length > 0) {
+      const seedConversation: StoredConversation = {
+        id: sessionId,
+        sessionId,
+        title: getConversationTitle(seedMessages),
+        messages: seedMessages,
+        updatedAt: Date.now(),
+      };
+      setConversations([seedConversation]);
+      setRoleConversations([
+        {
+          id: seedConversation.id,
+          title: seedConversation.title,
+          messages: buildRoleMessagesFromTurns(seedConversation.messages),
+          updatedAt: seedConversation.updatedAt,
+        },
+      ]);
+      loadConversationIntoUi(seedConversation);
+      return;
+    }
+
+    setSessionId(sessionId);
+  }, [
+    buildRoleMessagesFromTurns,
+    conversationsStorageKey,
+    getConversationTitle,
+    loadConversationIntoUi,
+    parseStoredConversations,
+    sanitizeConversationMessages,
+    setSessionId,
+  ]);
+
+  useEffect(() => {
+    if (!activeConversationId) {
+      return;
+    }
+    const trimmed = sanitizeConversationMessages(conversationHistory);
+    if (trimmed.length === 0) {
+      return;
+    }
+    setConversations((prev) => {
+      const now = Date.now();
+      let updated = false;
+      const next = prev.map((item) => {
+        if (item.id !== activeConversationId) {
+          return item;
+        }
+        updated = true;
+        return {
+          ...item,
+          title: item.title || getConversationTitle(trimmed),
+          messages: trimmed,
+          updatedAt: now,
+        };
+      });
+
+      if (!updated) {
+        next.unshift({
+          id: activeConversationId,
+          sessionId: activeConversationId,
+          title: getConversationTitle(trimmed),
+          messages: trimmed,
+          updatedAt: now,
+        });
+      }
+
+      return [...next].sort((a, b) => b.updatedAt - a.updatedAt).slice(0, MAX_CONVERSATIONS);
+    });
+  }, [activeConversationId, conversationHistory, getConversationTitle, sanitizeConversationMessages]);
+
+  useEffect(() => {
+    if (conversations.length === 0) {
+      return;
+    }
+    localStorage.setItem(conversationsStorageKey, JSON.stringify(conversations));
+    const activeConversation = conversations.find((item) => item.id === activeConversationId);
+    if (activeConversation) {
+      const legacyKey = `voice_history_${activeConversation.sessionId}`;
+      localStorage.setItem(legacyKey, JSON.stringify(activeConversation.messages));
+    }
+
+    const orderedConversations = [...conversations].sort((a, b) => b.updatedAt - a.updatedAt);
+    const roleConversations = orderedConversations
+      .map((conversation) => {
+        const roleMessages = buildRoleMessagesFromTurns(conversation.messages);
+        if (roleMessages.length === 0) {
+          return null;
+        }
+        return {
+          id: conversation.id,
+          title: conversation.title || getRoleConversationTitle(roleMessages),
+          messages: roleMessages,
+          updatedAt: conversation.updatedAt,
+        };
+      })
+      .filter((item): item is RoleConversation & { updatedAt: number } => Boolean(item))
+      .slice(0, MAX_CONVERSATIONS);
+
+    if (roleConversations.length > 0) {
+      localStorage.setItem(ROLE_CONVERSATIONS_KEY, JSON.stringify(roleConversations));
+      setRoleConversations(roleConversations);
+      if (activeConversationId) {
+        localStorage.setItem(ROLE_ACTIVE_CONVERSATION_KEY, activeConversationId);
+      }
+    }
+
+    scheduleSupabaseSync(conversations);
+  }, [
+    activeConversationId,
+    buildRoleMessagesFromTurns,
+    conversations,
+    conversationsStorageKey,
+    getRoleConversationTitle,
+    scheduleSupabaseSync,
+  ]);
 
   useEffect(() => {
     return () => {
-      abortActiveStream();
+      if (syncTimerRef.current !== null) {
+        window.clearTimeout(syncTimerRef.current);
+      }
     };
-  }, [abortActiveStream]);
+  }, []);
 
-  const playQueue = useCallback(async () => {
-    if (drainingQueueRef.current) {
-      return;
-    }
-    drainingQueueRef.current = true;
-    const playbackId = playbackCounterRef.current;
-
-    try {
-      while (audioQueueRef.current.length > 0 && playbackId === playbackCounterRef.current) {
-        const chunk = audioQueueRef.current.shift();
-        if (!chunk) {
-          continue;
-        }
-
-        const src = chunk.audio.startsWith("data:audio") ? chunk.audio : `data:audio/mp3;base64,${chunk.audio}`;
-        enqueueTyping(chunk.text);
-        await new Promise<void>((resolve) => {
-          const audio = new Audio(src);
-          audioRef.current = audio;
-          audio.onended = () => resolve();
-          audio.onerror = () => resolve();
-          void audio.play().catch(() => resolve());
-        });
-      }
-    } finally {
-      drainingQueueRef.current = false;
-      if (playbackId === playbackCounterRef.current) {
-        setVoiceState("idle");
-      }
-    }
-  }, [enqueueTyping, setVoiceState]);
-
-  const enqueueAudioChunk = useCallback((audioBase64?: string | null, textSegment = "") => {
-    if (!audioBase64) {
-      return;
-    }
-
-    stopListening();
-    if (audioQueueRef.current.length >= MAX_AUDIO_QUEUE) {
-      audioQueueRef.current = audioQueueRef.current.slice(-Math.floor(MAX_AUDIO_QUEUE / 2));
-      logFrontendEvent("audio_queue_trimmed", { size: audioQueueRef.current.length }, getOrCreateSessionId());
-    }
-    audioQueueRef.current.push({ audio: audioBase64, text: textSegment });
-    setVoiceState("speaking");
-    void playQueue();
-  }, [playQueue, setVoiceState, stopListening]);
+  // Auto-scroll to newest message
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [conversationHistory]);
 
   const playAudioFromBase64 = useCallback(
     async (audioBase64?: string | null) => {
@@ -303,34 +1017,37 @@ const VoiceInteraction = ({ language, onBack }: VoiceInteractionProps) => {
       // Always stop active recognition while assistant is speaking.
       stopListening();
       stopAudio();
-
-      const playbackId = playbackCounterRef.current;
       setVoiceState("speaking");
 
       const src = audioBase64.startsWith("data:audio") ? audioBase64 : `data:audio/mp3;base64,${audioBase64}`;
 
       await new Promise<void>((resolve) => {
-        const audio = new Audio(src);
-        audioRef.current = audio;
+        const audio = audioRef.current;
+        if (!audio) {
+          setVoiceState("idle");
+          resolve();
+          return;
+        }
+
+        audio.pause();
+        audio.currentTime = 0;
+
+        audio.src = src;
+        audio.load();
 
         audio.onended = () => {
-          if (playbackId === playbackCounterRef.current) {
-            setVoiceState("idle");
-          }
+          setVoiceState("idle");
           resolve();
         };
 
         audio.onerror = () => {
-          if (playbackId === playbackCounterRef.current) {
-            setVoiceState("idle");
-          }
+          setVoiceState("idle");
           resolve();
         };
 
-        void audio.play().catch(() => {
-          if (playbackId === playbackCounterRef.current) {
-            setVoiceState("idle");
-          }
+        audio.play().catch((err) => {
+          if (import.meta.env.DEV) console.warn("playAudioFromBase64 play failed:", err);
+          setVoiceState("idle");
           resolve();
         });
       });
@@ -341,268 +1058,423 @@ const VoiceInteraction = ({ language, onBack }: VoiceInteractionProps) => {
   const speakText = useCallback(
     async (text: string) => {
       try {
-        const tts = await synthesizeTts(text, uiLanguage);
+        const tts = await synthesizeTts(text, voiceLanguage);
         await playAudioFromBase64(tts.audio_base64);
       } catch {
         setVoiceState("idle");
       }
     },
-    [playAudioFromBase64, setVoiceState, uiLanguage],
+    [playAudioFromBase64, setVoiceState, voiceLanguage],
   );
 
-  const handleTranscript = useCallback(
+  const playTts = useCallback(
+    async (text: string) => {
+      const safeText = (text || "").trim();
+      if (!safeText) {
+        setVoiceState("idle");
+        return;
+      }
+
+      try {
+        setVoiceState("speaking");
+        const response = await fetch("/api/tts", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-language": voiceLanguage,
+          },
+          body: JSON.stringify({ text: safeText, language: voiceLanguage }),
+        });
+
+        if (!response.ok) {
+          throw new Error(`TTS request failed: ${response.status}`);
+        }
+
+        const payload = await response.json() as {
+          audio_base64?: string;
+          data?: { audio_base64?: string };
+        };
+        const base64 = String(payload?.audio_base64 || payload?.data?.audio_base64 || "").trim();
+        if (!base64) {
+          throw new Error("TTS response missing audio");
+        }
+
+        const audio = audioRef.current;
+        if (!audio) {
+          setVoiceState("idle");
+          return;
+        }
+
+        audio.pause();
+        audio.currentTime = 0;
+        const src = base64.startsWith("data:audio") ? base64 : `data:audio/mp3;base64,${base64}`;
+        await new Promise<void>((resolve) => {
+          audio.src = src;
+          audio.load();
+          audio.onended = () => resolve();
+          audio.onerror = () => resolve();
+          audio.play().catch(() => resolve());
+        });
+      } catch {
+        setSimpleError();
+      } finally {
+        setVoiceState("idle");
+      }
+    },
+    [setSimpleError, setVoiceState, voiceLanguage],
+  );
+
+  const handleIntent = useCallback(
+    async (text: string, turnId: string) => {
+      const cleaned = (text || "").trim();
+      if (!cleaned) {
+        setSimpleError();
+        return;
+      }
+
+      try {
+        const response = await fetch("/api/intent", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-language": voiceLanguage,
+          },
+          body: JSON.stringify({ text: cleaned, language: voiceLanguage }),
+        });
+        if (!response.ok) {
+          throw new Error(`Intent request failed: ${response.status}`);
+        }
+
+        const data = await response.json() as {
+          success?: boolean;
+          type?: string;
+          message?: string;
+          confidence?: number;
+          data?: {
+            message?: string;
+            scheme?: string;
+            summary?: string;
+            next_step?: string;
+          };
+        };
+
+        const mergedResponse = [data?.message, data?.data?.message, data?.data?.summary, data?.data?.next_step]
+          .filter((part): part is string => Boolean(part && part.trim()))
+          .join("\n\n")
+          .trim() || "Something went wrong";
+
+        setBackendResponse({
+          session_id: getOrCreateSessionId(),
+          response_text: mergedResponse,
+          field_name: null,
+          validation_passed: data?.success !== false,
+          validation_error: data?.success === false ? (data?.message || "Request failed") : null,
+          session_complete: false,
+          confidence: Number(data?.confidence || 0),
+          action: data?.type || null,
+          mode: "info",
+          scheme_details: data?.data?.scheme
+            ? {
+                title: data.data.scheme,
+                description: data?.data?.summary || undefined,
+                next_step: data?.data?.next_step || undefined,
+              }
+            : null,
+        });
+        setResponseText(mergedResponse);
+        updateConversationAssistantText(turnId, mergedResponse);
+        markFirstResponse();
+        await playTts(mergedResponse);
+      } catch {
+        setSimpleError();
+      }
+    },
+    [markFirstResponse, playTts, setBackendResponse, setResponseText, setSimpleError, updateConversationAssistantText, voiceLanguage],
+  );
+
+  const handleRecordedAudioStop = useCallback(
+    async (turnId: string) => {
+      try {
+        const blob = new Blob(mediaChunksRef.current, { type: "audio/webm" });
+        mediaChunksRef.current = [];
+        if (!blob.size) {
+          throw new Error("Empty recording");
+        }
+
+        setVoiceState("processing");
+        setLiveTranscript(voiceLanguage === "hi" ? "🎤 सुन रहा हूँ..." : "🎤 Listening...");
+
+        const formData = new FormData();
+        formData.append("audio", blob, "recording.webm");
+        formData.append("file", blob, "recording.webm");
+        formData.append("language", voiceLanguage);
+
+        const controller = new AbortController();
+        const timeoutId = window.setTimeout(() => controller.abort(), 15000);
+
+        const transcribeResponse = await fetch(`/api/transcribe?lang=${voiceLanguage}`, {
+          method: "POST",
+          headers: {
+            "x-language": voiceLanguage,
+          },
+          signal: controller.signal,
+          body: formData,
+        });
+        window.clearTimeout(timeoutId);
+        if (!transcribeResponse.ok) {
+          throw new Error(`Transcribe request failed: ${transcribeResponse.status}`);
+        }
+
+        const transcribeData = await transcribeResponse.json() as {
+          transcript?: string;
+          text?: string;
+          data?: {
+            transcript?: string;
+            text?: string;
+          };
+        };
+        const transcript = String(
+          transcribeData?.transcript
+            || transcribeData?.text
+            || transcribeData?.data?.transcript
+            || transcribeData?.data?.text
+            || "",
+        ).trim();
+
+        if (!transcript) {
+          throw new Error("No transcript returned");
+        }
+
+        setFinalTranscript(transcript);
+        setLiveTranscript(transcript);
+        setDetectedLanguage(detectTextLanguage(transcript));
+        useVoiceStore.getState().replaceConversationHistory(
+          useVoiceStore.getState().conversationHistory.map((turn) => (
+            turn.id === turnId ? { ...turn, userText: transcript } : turn
+          )),
+        );
+        await handleIntent(transcript, turnId);
+      } catch {
+        setSimpleError();
+      } finally {
+        processingRef.current = false;
+        setStreamDone(true);
+        setVoiceState("idle");
+        setIsRecording(false);
+        if (mediaStreamRef.current) {
+          try {
+            mediaStreamRef.current.getTracks().forEach((track) => track.stop());
+          } catch {
+            // no-op
+          }
+          mediaStreamRef.current = null;
+        }
+      }
+    },
+    [handleIntent, setDetectedLanguage, setFinalTranscript, setLiveTranscript, setSimpleError, setStreamDone, setVoiceState, voiceLanguage],
+  );
+
+  const handleTextQuery = useCallback(
     async (text: string) => {
       const cleaned = (text || "").trim();
-      if (!cleaned || processingRef.current) {
+      if (!cleaned) {
+        return;
+      }
+      if (isRecording || state === "processing" || state === "speaking") {
         return;
       }
 
       const now = Date.now();
-      if (lastTranscriptRef.current.text === cleaned && now - lastTranscriptRef.current.ts < 1500) {
+      if (lastTranscriptRef.current.text === cleaned && now - lastTranscriptRef.current.ts < 1000) {
         return;
       }
       lastTranscriptRef.current = { text: cleaned, ts: now };
 
-      abortActiveStream();
-      setFinalTranscript(cleaned);
-      setLiveTranscript("");
-      const inputLanguage = detectTextLanguage(cleaned);
-      setDetectedLanguage(inputLanguage);
-      logFrontendEvent("language_detected", { source: "transcript", inputLanguage }, getOrCreateSessionId());
-
+      ensureActiveConversationId();
       beginLatencyTracking();
-      setVoiceState("processing");
       processingRef.current = true;
-      const requestId = ++requestCounterRef.current;
-      const turnId = `turn-${Date.now()}-${requestId}`;
+      setVoiceState("processing");
+      setLiveTranscript(cleaned);
+      setFinalTranscript(cleaned);
+      setBackendResponse(null);
+      setErrorState(null);
+      setResponseText("");
+      clearResponseStream();
+      setStreamDone(false);
+
+      const turnId = `turn-${Date.now()}-${++requestCounterRef.current}`;
       activeTurnIdRef.current = turnId;
       addConversationTurn({
         id: turnId,
         userText: cleaned,
         assistantText: "",
-        language: uiLanguage,
+        language: backendLanguage,
         createdAt: Date.now(),
       });
-      clearResponseStream();
-      setStreamDone(false);
-      setErrorState(null);
-      setResponseText("");
 
-      let doneSeen = false;
-      const controller = new AbortController();
-      streamAbortRef.current = controller;
       try {
-        await processTextStream(
-          cleaned,
-          uiLanguage,
-          (event: ProcessTextStreamEvent) => {
-            if (requestId !== requestCounterRef.current) {
-              return;
-            }
-
-            if (event.type === "meta") {
-              const payload = event.payload;
-              markFirstResponse();
-              setBackendResponse(payload);
-              setResponseText(payload.response_text || "");
-              setDetectedLanguage(detectTextLanguage(payload.response_text || ""));
-              updateConversationAssistantText(turnId, payload.response_text || "");
-              processingRef.current = false;
-              setVoiceState("idle");
-              return;
-            }
-
-            if (event.type === "audio_chunk") {
-              markFirstAudioChunk();
-              logFrontendEvent("stream_first_chunk", { seq: event.seq }, getOrCreateSessionId());
-              enqueueAudioChunk(event.audio_base64, event.text_segment || "");
-              return;
-            }
-
-            if (event.type === "interrupted") {
-              abortActiveStream();
-              stopAudio();
-              setVoiceState("interrupted");
-              return;
-            }
-
-            if (event.type === "done") {
-              doneSeen = true;
-              setStreamDone(true);
-              logFrontendEvent("stream_done", { requestId }, getOrCreateSessionId());
-              if (!drainingQueueRef.current && audioQueueRef.current.length === 0) {
-                setVoiceState("idle");
-              }
-            }
-          },
-          (incomingRequestId) => {
-            setRequestId(incomingRequestId);
-            updateConversationAssistantText(turnId, useVoiceStore.getState().responseText || "");
-          },
-          {
-            signal: controller.signal,
-            retryAttempts: 2,
-            retryDelayMs: 300,
-          },
-        );
-        if (!doneSeen && requestId === requestCounterRef.current && !controller.signal.aborted) {
-          setStreamDone(true);
-          if (!drainingQueueRef.current && audioQueueRef.current.length === 0) {
-            setVoiceState("idle");
-          }
-        }
-      } catch {
-        try {
-          const response = await processText(cleaned, uiLanguage);
-          if (requestId !== requestCounterRef.current) {
-            return;
-          }
-          setBackendResponse(response);
-          setResponseText(response.response_text || "");
-          setDetectedLanguage(detectTextLanguage(response.response_text || ""));
-          setRequestId(response.request_id || null);
-          updateConversationAssistantText(turnId, response.response_text || "");
-          processingRef.current = false;
-          setVoiceState("idle");
-          if (response.audio_base64) {
-            enqueueTyping(response.response_text || "");
-            void playAudioFromBase64(response.audio_base64);
-          }
-        } catch {
-          if (requestId !== requestCounterRef.current) {
-            return;
-          }
-          processingRef.current = false;
-          setVoiceState("idle");
-          setErrorState(getFriendlyError("network", uiLanguage));
-          updateConversationAssistantText(turnId, uiLanguage === "hi" ? "नेटवर्क समस्या हुई, कृपया फिर से कोशिश करें।" : "Network issue, please retry.");
-          logFrontendEvent("error", { phase: "process_text" }, getOrCreateSessionId());
-        }
+        await handleIntent(cleaned, turnId);
       } finally {
-        if (streamAbortRef.current === controller) {
-          streamAbortRef.current = null;
-        }
+        processingRef.current = false;
+        setStreamDone(true);
         endLatencyTracking();
       }
     },
     [
-      abortActiveStream,
-      beginLatencyTracking,
       addConversationTurn,
+      beginLatencyTracking,
       clearResponseStream,
       endLatencyTracking,
-      enqueueAudioChunk,
-      enqueueTyping,
-      markFirstAudioChunk,
-      markFirstResponse,
-      playAudioFromBase64,
-      stopAudio,
+      ensureActiveConversationId,
+      handleIntent,
+      isRecording,
       setBackendResponse,
-      setDetectedLanguage,
       setErrorState,
-      setRequestId,
       setFinalTranscript,
       setLiveTranscript,
       setResponseText,
       setStreamDone,
       setVoiceState,
-      updateConversationAssistantText,
-      uiLanguage,
+      state,
+      voiceLanguage,
     ],
   );
 
   const startListening = useCallback(() => {
-    if (processingRef.current || state === "processing" || state === "speaking" || state === "listening") {
-      return;
-    }
-
-    const SpeechRecognition = getSpeechRecognitionCtor();
-    if (!SpeechRecognition) {
-      setErrorState(uiLanguage === "hi" ? "इस ब्राउज़र में वॉइस सपोर्ट नहीं है।" : "Voice recognition is not supported in this browser.");
+    if (isRecording || processingRef.current || state === "processing" || state === "speaking" || state === "listening") {
       return;
     }
 
     stopListening();
     stopAudio();
     setErrorState(null);
+    setLiveTranscript("");
+    setFinalTranscript("");
 
-    const recognition = new SpeechRecognition();
-    recognition.lang = uiLanguage === "hi" ? "hi-IN" : "en-US";
-    recognition.interimResults = true;
-    recognition.continuous = false;
+    ensureActiveConversationId();
+    beginLatencyTracking();
+    processingRef.current = true;
+    const requestId = ++requestCounterRef.current;
+    const turnId = `turn-${Date.now()}-${requestId}`;
+    activeTurnIdRef.current = turnId;
+    addConversationTurn({
+      id: turnId,
+      userText: copy.processingAudio,
+      assistantText: "",
+      language: backendLanguage,
+      createdAt: Date.now(),
+    });
+    clearResponseStream();
+    setStreamDone(false);
+    setErrorState(null);
+    setResponseText("");
+    setBackendResponse(null);
+    setLiveTranscript(voiceLanguage === "hi" ? "🎤 सुन रहा हूँ..." : "🎤 Listening...");
 
-    recognition.onresult = (event) => {
-      let text = "";
-      let interim = "";
-      const startIndex = event.resultIndex ?? 0;
-      for (let idx = startIndex; idx < event.results.length; idx += 1) {
-        const result = event.results[idx];
-        if (result?.isFinal) {
-          text += `${result[0]?.transcript || ""} `;
-        } else {
-          interim += `${result[0]?.transcript || ""} `;
+    navigator.mediaDevices
+      .getUserMedia({ audio: true })
+      .then((stream) => {
+        const recorder = new MediaRecorder(stream);
+        mediaRecorderRef.current = recorder;
+        mediaStreamRef.current = stream;
+        mediaChunksRef.current = [];
+        setIsRecording(true);
+
+        if (silenceTimerRef.current !== null) {
+          window.clearTimeout(silenceTimerRef.current);
         }
-      }
-      setLiveTranscript(interim.trim());
-      text = text.trim();
+        silenceTimerRef.current = window.setTimeout(() => {
+          const current = mediaRecorderRef.current;
+          if (current && current.state !== "inactive") {
+            try {
+              current.stop();
+            } catch {
+              // no-op
+            }
+          }
+        }, 2500);
 
-      if (!text) {
-        return;
-      }
+        recorder.ondataavailable = (event: BlobEvent) => {
+          if (event.data && event.data.size > 0) {
+            mediaChunksRef.current.push(event.data);
+          }
+        };
 
-      if (text.length < 2) {
+        recorder.onerror = () => {
+          setSimpleError();
+          processingRef.current = false;
+          setVoiceState("idle");
+          setIsRecording(false);
+        };
+
+        recorder.onstop = () => {
+          if (silenceTimerRef.current !== null) {
+            window.clearTimeout(silenceTimerRef.current);
+            silenceTimerRef.current = null;
+          }
+          mediaRecorderRef.current = null;
+          void handleRecordedAudioStop(turnId).finally(() => {
+            endLatencyTracking();
+          });
+        };
+
+        recorder.start();
+        setVoiceState("listening");
+        logFrontendEvent("voice_state", { state: "listening" }, getOrCreateSessionId());
+      })
+      .catch(() => {
+        processingRef.current = false;
         setVoiceState("idle");
-        setErrorState(uiLanguage === "hi" ? "आवाज़ स्पष्ट नहीं थी, फिर से बोलें।" : "Speech was unclear, please try again.");
-        return;
-      }
-
-      recognitionRef.current = null;
-      setVoiceState("idle");
-      void handleTranscript(text);
-    };
-
-    recognition.onerror = () => {
-      recognitionRef.current = null;
-      setVoiceState("idle");
-      setErrorState(uiLanguage === "hi" ? "वॉइस रिकग्निशन असफल रहा, फिर से कोशिश करें।" : "Speech recognition failed. Please try again.");
-    };
-
-    recognition.onend = () => {
-      recognitionRef.current = null;
-      setLiveTranscript("");
-      if (useVoiceStore.getState().voiceState === "listening") {
-        setVoiceState("idle");
-      }
-    };
-
-    recognitionRef.current = recognition;
-    setVoiceState("listening");
-    logFrontendEvent("voice_state", { state: "listening" }, getOrCreateSessionId());
-    try {
-      recognition.start();
-    } catch {
-      recognitionRef.current = null;
-      setVoiceState("idle");
-      setErrorState(uiLanguage === "hi" ? "माइक चालू नहीं हो पाया, फिर से कोशिश करें।" : "Could not start microphone. Please try again.");
-    }
-  }, [handleTranscript, setErrorState, setLiveTranscript, setVoiceState, state, stopAudio, stopListening, uiLanguage]);
+        setSimpleError();
+        setIsRecording(false);
+        endLatencyTracking();
+      });
+  }, [
+    addConversationTurn,
+    beginLatencyTracking,
+    clearResponseStream,
+    copy.processingAudio,
+    endLatencyTracking,
+    ensureActiveConversationId,
+    handleRecordedAudioStop,
+    setErrorState,
+    setBackendResponse,
+    setFinalTranscript,
+    setLiveTranscript,
+    setResponseText,
+    setSimpleError,
+    setStreamDone,
+    setVoiceState,
+    isRecording,
+    state,
+    stopAudio,
+    stopListening,
+    voiceLanguage,
+  ]);
 
   const handleMicClick = useCallback(() => {
-    setMicPulseKey((prev) => prev + 1);
-    logFrontendEvent("mic_tap", { state }, getOrCreateSessionId());
-    if (state === "speaking") {
-      stopAudio();
-      setVoiceState("interrupted");
-      setLiveTranscript("");
-      logFrontendEvent("barge_in", {}, getOrCreateSessionId());
-      void interruptTts().catch(() => undefined);
-      window.setTimeout(() => {
-        startListening();
-      }, 80);
+    if (isRecording || state === "processing" || state === "speaking") {
       return;
     }
+    logFrontendEvent("mic_tap", { state }, getOrCreateSessionId());
+
+    if (state === "listening") {
+      stopListening();
+      return;
+    }
+
+    // Unlock autoplay by "touching" the audio element on first user gesture
+    if (audioRef.current) {
+      const audio = audioRef.current;
+      if (!audio.src || audio.src === window.location.href) {
+        audio.src = "data:audio/mp3;base64,//NExAAAAANIAAAAAExBTUUzLjEwMKqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq";
+        audio.load();
+        audio.play().catch(() => {});
+      }
+    }
+
     startListening();
-  }, [setLiveTranscript, setVoiceState, startListening, state, stopAudio]);
+  }, [isRecording, setLiveTranscript, setVoiceState, startListening, state, stopAudio]);
 
   const handleRestart = useCallback(async () => {
     stopListening();
@@ -623,13 +1495,23 @@ const VoiceInteraction = ({ language, onBack }: VoiceInteractionProps) => {
     localStorage.removeItem(`voice_history_${previousSessionId}`);
     localStorage.removeItem(`voice_history_${nextSessionId}`);
 
+    const resetConversation: StoredConversation = {
+      id: nextSessionId,
+      sessionId: nextSessionId,
+      title: "",
+      messages: [],
+      updatedAt: Date.now(),
+    };
+    setConversations((prev) => [resetConversation, ...prev].slice(0, MAX_CONVERSATIONS));
+    setActiveConversationId(nextSessionId);
+    setSessionId(nextSessionId);
+
     resetConversationState();
     clearConversationHistory();
     setVoiceState("idle");
-    setRequestId(null);
     setTextFallback("");
 
-    const greeting = getGreeting(uiLanguage);
+    const greeting = getGreeting(backendLanguage);
     setResponseText(greeting);
     clearResponseStream();
     void speakText(greeting);
@@ -637,34 +1519,36 @@ const VoiceInteraction = ({ language, onBack }: VoiceInteractionProps) => {
     clearConversationHistory,
     clearResponseStream,
     resetConversationState,
-    setRequestId,
+    setActiveConversationId,
+    setConversations,
     setResponseText,
+    setSessionId,
     setVoiceState,
     speakText,
     stopAudio,
     stopListening,
-    uiLanguage,
+    voiceLanguage,
   ]);
 
   useEffect(() => {
     if (hasPlayedGreetingRef.current) return;
     hasPlayedGreetingRef.current = true;
-    setLanguage(uiLanguage);
-    setDetectedLanguage(uiLanguage);
+    setLanguage(backendLanguage);
+    setDetectedLanguage(backendLanguage);
 
-    const greeting = getGreeting(uiLanguage);
+    const greeting = getGreeting(backendLanguage);
 
     setResponseText(greeting);
     void speakText(greeting);
-  }, [setDetectedLanguage, setLanguage, setResponseText, speakText, uiLanguage]);
+  }, [backendLanguage, setDetectedLanguage, setLanguage, setResponseText, speakText]);
 
   useEffect(() => {
     return () => {
       stopListening();
       stopAudio();
-      stopTyping();
+      void interruptTts().catch(() => undefined);
     };
-  }, [stopAudio, stopListening, stopTyping]);
+  }, [stopAudio, stopListening]);
 
   useEffect(() => {
     if (!latency.lastRoundTripMs) {
@@ -704,68 +1588,146 @@ const VoiceInteraction = ({ language, onBack }: VoiceInteractionProps) => {
 
   const statusText =
     state === "listening"
-      ? uiLanguage === "hi"
-        ? "🎤 सुन रहा हूँ..."
-        : "🎤 Listening..."
+      ? copy.statusListening
       : state === "processing"
-        ? uiLanguage === "hi"
-          ? "🤖 सोच रहा हूँ..."
-          : "🤖 Thinking..."
+        ? copy.statusProcessing
       : state === "speaking"
-        ? uiLanguage === "hi"
-          ? "🔊 जवाब दे रहा हूँ..."
-          : "🔊 Speaking..."
+        ? copy.statusSpeaking
         : state === "interrupted"
-          ? uiLanguage === "hi"
-            ? "⏹ रोका गया, अब बोलें"
-            : "⏹ Interrupted, speak now"
-        : uiLanguage === "hi"
-          ? "माइक दबाकर बोलें"
-          : "Tap mic to speak";
+          ? copy.statusInterrupted
+          : copy.statusIdle;
+  const statusWithEmoji =
+    state === "listening"
+      ? `🎤 ${copy.statusListening}`
+      : state === "processing"
+        ? `🤖 ${copy.statusProcessing}`
+        : state === "speaking"
+          ? `🔊 ${copy.statusSpeaking}`
+          : statusText;
 
-  const statusSubText = useMemo(() => {
-    if (state === "listening") {
-      return uiLanguage === "hi" ? "हम आपकी आवाज़ कैप्चर कर रहे हैं" : "We are capturing your voice";
-    }
-    if (state === "processing") {
-      return uiLanguage === "hi" ? "तुरंत जवाब तैयार हो रहा है" : "Preparing an instant response";
-    }
-    if (state === "speaking") {
-      return uiLanguage === "hi" ? "जवाब बोल रहा हूँ, टैप करके रोक सकते हैं" : "Speaking now, tap mic to interrupt";
-    }
-    if (state === "interrupted") {
-      return uiLanguage === "hi" ? "अब आप बोल सकते हैं" : "You can speak now";
-    }
-    return uiLanguage === "hi" ? "स्पेस या एंटर दबाकर भी शुरू कर सकते हैं" : "You can also press Space or Enter to start";
-  }, [state, uiLanguage]);
-
-  const mode = response?.mode;
-  const quickActions = response?.quick_actions || [];
-  const schemeDetails = response?.scheme_details;
-  const stepsDone = response?.steps_done || 0;
-  const stepsTotal = response?.steps_total || 0;
-  const completedFields = response?.completed_fields || [];
-
-  const handleQuickAction = useCallback((value: string) => {
-    if (!value || state !== "idle") {
-      return;
-    }
-    logFrontendEvent("quick_action", { value }, getOrCreateSessionId());
-    void handleTranscript(value);
-  }, [handleTranscript, state]);
-
-  const clarifyPrimary = quickActions.find((item) => item.value === "need_information") || {
-    label: uiLanguage === "hi" ? "जानकारी चाहिए" : "Get Information",
-    value: "need_information",
-  };
-  const clarifySecondary = quickActions.find((item) => item.value === "start_application") || {
-    label: uiLanguage === "hi" ? "आवेदन शुरू करें" : "Apply Now",
-    value: "start_application",
-  };
-  const showEmptySuggestions = !response && !transcriptFinal;
-  const displayedAssistantText = responseStream || assistantText;
+  const displayedAssistantText = assistantText;
   const effectiveErrorText = errorState || "";
-  const showOnboarding = conversationHistory.length === 0 && !transcriptFinal && state === "idle";
+  const transcriptLine = liveTranscript || transcriptFinal;
+  const confidenceLabel = useMemo(() => {
+    const raw = Number(backendResponse?.confidence ?? 0);
+    if (!Number.isFinite(raw) || raw <= 0) {
+      return "Low";
+    }
+    const normalized = raw > 1 ? raw / 100 : raw;
+    if (normalized >= 0.8) {
+      return "High";
+    }
+    if (normalized >= 0.5) {
+      return "Medium";
+    }
+    return "Low";
+  }, [backendResponse?.confidence]);
+  const lastAssistantText = useMemo(() => {
+    for (let i = conversationHistory.length - 1; i >= 0; i -= 1) {
+      const text = conversationHistory[i]?.assistantText?.trim();
+      if (text) {
+        return text;
+      }
+    }
+    return displayedAssistantText || "";
+  }, [conversationHistory, displayedAssistantText]);
+
+  const conversationHistoryForDisplay = useMemo(() => {
+    const clarificationHints = [
+      "clarify your request",
+      "please clarify",
+      "कृपया अपना प्रश्न",
+      "थोड़ा स्पष्ट",
+    ];
+
+    return conversationHistory.reduce<ConversationTurn[]>((acc, turn) => {
+      const prev = acc[acc.length - 1];
+      const currAssistant = (turn.assistantText || "").trim();
+      const prevAssistant = (prev?.assistantText || "").trim();
+
+      if (currAssistant && prevAssistant) {
+        const currNorm = currAssistant.toLowerCase().replace(/\s+/g, " ");
+        const prevNorm = prevAssistant.toLowerCase().replace(/\s+/g, " ");
+        const isSameAssistant = currNorm === prevNorm;
+        const looksClarification = clarificationHints.some((hint) => currNorm.includes(hint));
+        if (isSameAssistant || looksClarification) {
+          return acc;
+        }
+      }
+
+      acc.push(turn);
+      return acc;
+    }, []);
+  }, [conversationHistory]);
+
+  const detectedScheme = useMemo(
+    () => (backendResponse?.scheme_details?.title || "").trim(),
+    [backendResponse?.scheme_details?.title],
+  );
+
+  const schemeBadgeName = useMemo(() => {
+    if (detectedScheme) {
+      return detectedScheme;
+    }
+    return "";
+  }, [detectedScheme]);
+
+  const showStandaloneResponseCard = useMemo(() => {
+    if (!displayedAssistantText) {
+      return false;
+    }
+    const normalized = displayedAssistantText.trim().toLowerCase().replace(/\s+/g, " ");
+    const alreadyInHistory = conversationHistoryForDisplay.some(
+      (turn) => (turn.assistantText || "").trim().toLowerCase().replace(/\s+/g, " ") === normalized,
+    );
+    return !alreadyInHistory;
+  }, [conversationHistoryForDisplay, displayedAssistantText]);
+
+  const quickActions = useMemo(
+    () => [
+      {
+        label: copy.quickApply,
+        fallback: copy.quickApply,
+        buildQuery: (scheme: string) => copy.quickApplyQuery(scheme),
+      },
+      {
+        label: copy.quickAmount,
+        fallback: copy.quickAmount,
+        buildQuery: (scheme: string) => copy.quickAmountQuery(scheme),
+      },
+      {
+        label: copy.quickDocs,
+        fallback: copy.quickDocs,
+        buildQuery: (scheme: string) => copy.quickDocsQuery(scheme),
+      },
+    ],
+    [copy],
+  );
+
+  const handleQuickActionClick = useCallback(
+    (action: { label: string; fallback: string; buildQuery: (scheme: string) => string }) => {
+      if (state !== "idle") {
+        return;
+      }
+      const query = detectedScheme ? action.buildQuery(detectedScheme) : action.fallback;
+      void handleTextQuery(query);
+    },
+    [detectedScheme, handleTextQuery, state],
+  );
+  const activeSidebarId = activeConversationId || localStorage.getItem(ROLE_ACTIVE_CONVERSATION_KEY) || null;
+  const sidebarItems = useMemo(() => {
+    if (roleConversations.length === 0) {
+      return [];
+    }
+    if (!activeSidebarId) {
+      return roleConversations;
+    }
+    const exists = roleConversations.some((item) => item.id === activeSidebarId);
+    if (exists) {
+      return roleConversations;
+    }
+    return roleConversations;
+  }, [activeSidebarId, roleConversations]);
 
   const submitFallbackText = useCallback(() => {
     const cleaned = textFallback.trim();
@@ -773,284 +1735,232 @@ const VoiceInteraction = ({ language, onBack }: VoiceInteractionProps) => {
       return;
     }
     setTextFallback("");
-    void handleTranscript(cleaned);
-  }, [handleTranscript, state, textFallback]);
+    void handleTextQuery(cleaned);
+  }, [handleTextQuery, state, textFallback]);
 
   const retryLast = useCallback(() => {
     if (!transcriptFinal) {
       return;
     }
-    void handleTranscript(transcriptFinal);
-  }, [handleTranscript, transcriptFinal]);
-
-  const firstResponseMs = latency.requestStartedAt && latency.firstResponseAt
-    ? Math.max(0, Math.round(latency.firstResponseAt - latency.requestStartedAt))
-    : null;
-  const firstAudioMs = latency.requestStartedAt && latency.firstAudioChunkAt
-    ? Math.max(0, Math.round(latency.firstAudioChunkAt - latency.requestStartedAt))
-    : null;
-
-  useEffect(() => {
-    const turnId = activeTurnIdRef.current;
-    if (!turnId) {
-      return;
-    }
-    if (!displayedAssistantText) {
-      return;
-    }
-    updateConversationAssistantText(turnId, displayedAssistantText);
-  }, [displayedAssistantText, updateConversationAssistantText]);
+    void handleTextQuery(transcriptFinal);
+  }, [handleTextQuery, transcriptFinal]);
 
   return (
-    <div className="h-screen bg-[radial-gradient(circle_at_top,#134e4a30_0%,#0b1120_35%,#030712_100%)] flex flex-col relative text-[#e2e8f0] overflow-hidden" role="application" aria-label="Voice assistant interface">
-      <Suspense fallback={null}>
-        <SparkleBackground />
-      </Suspense>
+    <div className="relative min-h-screen bg-[linear-gradient(180deg,#0B0B0B_0%,#020202_100%)] text-white flex" role="application" aria-label={copy.appLabel}>
+      <SparkleBackground />
+      {sidebarOpen ? (
+        <button
+          type="button"
+          onClick={() => setSidebarOpen(false)}
+          className="fixed inset-0 bg-black/60 z-20 md:hidden"
+          aria-label={copy.closeMenu}
+        />
+      ) : null}
 
-      <div className="pointer-events-none absolute inset-0 bg-[linear-gradient(160deg,rgba(245,158,11,0.1),transparent_35%,rgba(20,184,166,0.12)_80%)]" />
-      <div className="pointer-events-none absolute -top-28 -left-20 w-72 h-72 rounded-full bg-[#f59e0b]/10 blur-3xl" />
-      <div className="pointer-events-none absolute -bottom-24 -right-20 w-80 h-80 rounded-full bg-[#14b8a6]/10 blur-3xl" />
+      <aside
+        className={`fixed md:static top-0 left-0 h-full w-64 border-r border-white/10 bg-[#111827]/90 backdrop-blur-xl p-4 z-30 transition-transform duration-200 ${
+          sidebarOpen ? "translate-x-0" : "-translate-x-full md:translate-x-0"
+        }`}
+      >
+        <div className="flex flex-col h-full">
+          <div className="flex items-center justify-between">
+            <p className="text-xs uppercase tracking-wide text-gray-400">
+              {copy.chats}
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={handleNewChat}
+            className="mt-3 w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm font-semibold text-amber-200 hover:bg-white/10"
+          >
+            {copy.newChat}
+          </button>
 
-      <div className="relative z-10 flex items-center justify-between px-3 md:px-4 py-1.5 border-b border-white/10 bg-black/35 backdrop-blur-xl">
-        <BackButton onClick={onBack} label={uiLanguage === "hi" ? "भाषा बदलें" : "Change language"} />
-        <div className="flex items-center gap-2.5">
-          <div className="flex items-center gap-2 text-white">
-            <div className="w-7 h-7 rounded-xl bg-gradient-to-br from-[#f59e0b] to-[#fb7185] grid place-items-center shadow-[0_0_16px_rgba(245,158,11,0.35)]">
-              <Mic className="w-3.5 h-3.5 text-black" />
-            </div>
-            <span className="font-semibold tracking-wide bg-gradient-to-r from-yellow-300 to-rose-300 text-transparent bg-clip-text">Voice OS Bharat</span>
-            <div className="ml-1 flex items-center gap-2 px-3 py-1 rounded-full border bg-white/5 text-xs font-medium border-[#f59e0b]/40 text-[#f59e0b]">
-              <Sparkles className="w-3.5 h-3.5" />
-              {language.nativeName}
-            </div>
-            <div className="ml-1 px-2.5 py-1 rounded-full border border-cyan-300/40 bg-cyan-500/10 text-cyan-100 text-[11px] font-semibold">
-              {detectedLanguage === "hi" ? "Detected: हिन्दी" : "Detected: English"}
-            </div>
+          <div className="mt-4 flex-1 overflow-y-auto space-y-2">
+            {sidebarItems.length === 0 ? (
+              <p className="text-sm text-gray-400">
+                {copy.noConversations}
+              </p>
+            ) : null}
+            {sidebarItems.map((conversation) => {
+              const isActive = conversation.id === activeSidebarId;
+              const baseTitle = conversation.title || copy.newChat;
+              const title = baseTitle.length > 25 ? `${baseTitle.slice(0, 25).trim()}...` : baseTitle;
+              return (
+                <button
+                  key={conversation.id}
+                  type="button"
+                  onClick={() => handleSelectConversation(conversation.id)}
+                  className={`w-full rounded-xl border px-3 py-2 text-left transition ${
+                    isActive
+                      ? "border-amber-300/50 bg-white/10 text-amber-100"
+                      : "border-white/10 bg-white/5 text-white hover:bg-white/10"
+                  }`}
+                >
+                  <span className="block text-sm font-semibold truncate">{title}</span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      </aside>
+
+      <div className="flex-1 min-w-0 flex flex-col">
+        <header className="flex items-center justify-between px-4 py-3 border-b border-white/10">
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setSidebarOpen(true)}
+              className="md:hidden inline-flex items-center justify-center w-9 h-9 rounded-xl border border-white/10 bg-white/5 hover:bg-white/10"
+              aria-label={copy.openMenu}
+            >
+              <Menu className="w-4 h-4" />
+            </button>
+            <BackButton onClick={onBack} label={copy.changeLanguage} />
           </div>
           <button
             type="button"
             onClick={() => {
               void handleRestart();
             }}
-            className="ml-1 inline-flex items-center gap-1.5 px-3 py-1 rounded-full border border-white/20 bg-white/10 text-white text-xs hover:border-[#f59e0b]/60 hover:shadow-[0_0_14px_rgba(245,158,11,0.25)] transition-all"
+            className="inline-flex items-center gap-2 px-3 py-1.5 rounded-xl border border-white/10 bg-white/5 hover:bg-white/10 text-xs"
           >
             <RotateCcw className="w-3.5 h-3.5" />
-            {uiLanguage === "hi" ? "रीस्टार्ट" : "Restart"}
+            {copy.restart}
           </button>
-          <button
-            type="button"
-            onClick={() => setDemoMode(!demoMode)}
-            className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full border border-cyan-300/35 bg-cyan-500/10 text-cyan-100 text-xs hover:bg-cyan-500/20 transition-all"
-          >
-            {demoMode ? (uiLanguage === "hi" ? "डेमो मोड ऑन" : "Demo Mode On") : (uiLanguage === "hi" ? "डेमो मोड" : "Demo Mode")}
-          </button>
-        </div>
-      </div>
+        </header>
 
-      <div className="relative z-10 flex-1 min-h-0 flex flex-col items-center justify-center px-4 py-4">
-        <div className="w-full max-w-3xl rounded-3xl border border-white/10 bg-white/[0.06] backdrop-blur-2xl px-4 md:px-7 py-5 space-y-5 shadow-[0_24px_70px_rgba(0,0,0,0.45)]">
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="px-2.5 py-1 rounded-full text-[11px] font-semibold border border-cyan-300/40 bg-cyan-500/10 text-cyan-100">AI-powered</span>
-            <span className="px-2.5 py-1 rounded-full text-[11px] font-semibold border border-emerald-300/40 bg-emerald-500/10 text-emerald-100">Bilingual</span>
-            {mode ? <ModeIndicator mode={mode} /> : null}
-            <span className="px-2.5 py-1 rounded-full text-[11px] font-semibold border border-amber-300/40 bg-amber-500/10 text-amber-100">{uiLanguage === "hi" ? "सहायक: सखी" : "Assistant: Sakhi"}</span>
-          </div>
-
-          {showOnboarding ? (
-            <OnboardingPanel
-              uiLanguage={uiLanguage}
-              onSamplePick={(query) => {
-                void handleTranscript(query);
-              }}
-            />
+        <div className="flex-1 overflow-y-auto px-4 py-4 space-y-4">
+          {conversationHistory.length === 0 ? (
+            <p className="text-sm text-gray-400">
+              {copy.startConversationHint}
+            </p>
           ) : null}
 
-          <div className="space-y-1.5">
-            <h2 className="text-2xl md:text-3xl font-semibold text-white leading-tight animate-[fadeIn_360ms_ease-out]">
-              {uiLanguage === "hi" ? "आइए, आपकी आवाज़ से शुरुआत करें" : "Let us start with your voice"}
-            </h2>
-            <p className="text-sm text-gray-300 animate-[fadeIn_420ms_ease-out]" aria-live="polite" role="status">{statusText}</p>
-            <p className="text-xs text-gray-400">{statusSubText}</p>
-            <div className="flex flex-wrap gap-2 text-[11px] text-cyan-100/90">
-              {firstResponseMs !== null ? <span className="px-2 py-0.5 rounded-full border border-cyan-300/30 bg-cyan-500/10">First response: {firstResponseMs}ms</span> : null}
-              {firstAudioMs !== null ? <span className="px-2 py-0.5 rounded-full border border-emerald-300/30 bg-emerald-500/10">First audio: {firstAudioMs}ms</span> : null}
-              {latency.lastRoundTripMs ? <span className="px-2 py-0.5 rounded-full border border-amber-300/30 bg-amber-500/10">Round trip: {Math.round(latency.lastRoundTripMs)}ms</span> : null}
-            </div>
-          </div>
-
-          <div className="grid place-items-center py-2">
-            <div className="relative">
-              {micPulseKey > 0 ? (
-                <span
-                  key={micPulseKey}
-                  className="absolute -inset-12 rounded-full border border-[#f59e0b]/45 animate-ping"
-                />
-              ) : null}
-              {state === "listening" && (
-                <>
-                  <div className="absolute -inset-8 rounded-full bg-[#f59e0b]/20 blur-xl animate-pulse" />
-                  <div className="absolute -inset-12 rounded-full border border-[#f59e0b]/30 animate-ping" />
-                </>
-              )}
-              {state === "speaking" && (
-                <>
-                  <div className="absolute -inset-8 rounded-full bg-[#14b8a6]/20 blur-xl animate-pulse" />
-                  <div className="absolute -bottom-4 left-1/2 -translate-x-1/2 flex items-end gap-1.5">
-                    <span className="w-1.5 h-4 rounded-full bg-teal-300/80 animate-pulse" />
-                    <span className="w-1.5 h-6 rounded-full bg-teal-200/90 animate-pulse [animation-delay:120ms]" />
-                    <span className="w-1.5 h-3 rounded-full bg-teal-300/80 animate-pulse [animation-delay:240ms]" />
+          {conversationHistoryForDisplay.map((turn) => (
+            <div key={turn.id} className="space-y-3">
+              {turn.userText ? (
+                <div className="flex justify-end">
+                  <div className="max-w-[80%] rounded-2xl border border-white/10 bg-[#111827] px-4 py-2 text-lg leading-relaxed text-white">
+                    {turn.userText}
                   </div>
-                </>
-              )}
-              <button
-                type="button"
-                onClick={handleMicClick}
-                disabled={state === "processing"}
-                aria-label={uiLanguage === "hi" ? "माइक्रोफ़ोन नियंत्रित करें" : "Control microphone"}
-                aria-pressed={state === "listening"}
-                className="relative z-10 w-36 h-36 md:w-40 md:h-40 rounded-full border border-white/20 bg-gradient-to-br from-[#0f172a] to-[#111827] text-white grid place-items-center shadow-[0_18px_60px_rgba(0,0,0,0.55)] disabled:opacity-55 hover:scale-105 hover:shadow-[0_0_24px_rgba(245,158,11,0.28)] active:scale-95 transition-all"
-              >
-                <Mic className="w-12 h-12" />
-              </button>
+                </div>
+              ) : null}
+              {turn.assistantText ? (
+                <div className="flex justify-start">
+                  <div className="max-w-[80%] rounded-2xl border border-white/10 bg-[#111827] px-4 py-2 text-lg leading-relaxed text-white">
+                    {turn.assistantText}
+                  </div>
+                </div>
+              ) : null}
             </div>
-          </div>
-
-          {mode === "action" && stepsTotal > 0 ? (
-            <ActionCard
-              stepsDone={stepsDone}
-              stepsTotal={stepsTotal}
-              completedFields={completedFields}
-              uiLanguage={uiLanguage}
-            />
+          ))}
+          {lastAssistantText ? (
+            <div className="flex flex-wrap gap-3 pt-2">
+              {quickActions.map((action) => (
+                <button
+                  key={action.label}
+                  type="button"
+                  onClick={() => handleQuickActionClick(action)}
+                  disabled={state !== "idle"}
+                  className="rounded-xl border border-white/10 bg-white/5 px-4 py-2 text-base font-semibold text-white hover:bg-white/10 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {action.label}
+                </button>
+              ))}
+            </div>
           ) : null}
 
-          {mode === "info" && schemeDetails ? (
-            <KnowledgeCard
-              uiLanguage={uiLanguage}
-              title={schemeDetails.title}
-              description={schemeDetails.description}
-              eligibility={schemeDetails.next_step}
-            />
-          ) : null}
-
-          {mode === "clarify" ? (
-            <div className="rounded-2xl border border-amber-300/30 bg-amber-500/10 px-4 py-3 animate-[fadeIn_280ms_ease-out]">
-              <p className="text-xs uppercase tracking-wide text-amber-100/85 mb-2">
-                {uiLanguage === "hi" ? "कृपया विकल्प चुनें" : "Choose one option"}
-              </p>
-              <div className="flex flex-wrap gap-2">
-                <button
-                  type="button"
-                  disabled={state !== "idle"}
-                  onClick={() => {
-                    handleQuickAction(clarifyPrimary.value);
-                  }}
-                  className="px-3.5 py-2 rounded-full text-xs font-semibold bg-amber-200 text-amber-900 hover:bg-amber-100 hover:shadow-[0_0_14px_rgba(251,191,36,0.45)] disabled:opacity-60 transition-all"
-                >
-                  {uiLanguage === "hi" ? "जानकारी चाहिए" : "Get Information"}
-                </button>
-                <button
-                  type="button"
-                  disabled={state !== "idle"}
-                  onClick={() => {
-                    handleQuickAction(clarifySecondary.value);
-                  }}
-                  className="px-3.5 py-2 rounded-full text-xs font-semibold bg-white/15 border border-white/30 text-white hover:border-amber-200/80 hover:shadow-[0_0_14px_rgba(251,191,36,0.25)] disabled:opacity-60 transition-all"
-                >
-                  {uiLanguage === "hi" ? "अभी आवेदन करें" : "Apply Now"}
-                </button>
+          {showStandaloneResponseCard ? (
+            <div className="rounded-2xl border border-amber-300/20 bg-[linear-gradient(180deg,rgba(17,24,39,0.95)_0%,rgba(15,23,42,0.92)_100%)] px-4 py-4 shadow-[0_18px_40px_rgba(0,0,0,0.45)] animate-[fadeIn_220ms_ease-out] space-y-2">
+              <div className="flex items-center justify-between gap-2">
+                <p className="text-xs uppercase tracking-[0.14em] text-amber-200/85">Assistant Response</p>
+                <span className="rounded-full border border-amber-300/35 bg-amber-300/10 px-2.5 py-1 text-[11px] font-semibold text-amber-100">
+                  Confidence: {confidenceLabel}
+                </span>
               </div>
+              {schemeBadgeName ? (
+                <div className="inline-flex items-center rounded-full border border-amber-300/35 bg-amber-300/10 px-3 py-1 text-xs font-semibold text-amber-100">
+                  Scheme: {schemeBadgeName}
+                </div>
+              ) : null}
+              <p className="text-base leading-relaxed text-slate-100">{displayedAssistantText}</p>
             </div>
           ) : null}
+          <div ref={chatEndRef} />
+        </div>
 
-          <div className="flex flex-wrap gap-2 justify-center">
-            {quickActions.length > 0 && mode !== "clarify" ? (
-              <QuickActions
-                uiLanguage={uiLanguage}
-                actions={quickActions}
-                disabled={state !== "idle"}
-                onSelect={handleQuickAction}
-              />
-            ) : showEmptySuggestions ? (
-              quickPrompts.map((item) => (
-                <button
-                  key={item}
-                  type="button"
-                  disabled={state !== "idle"}
-                  onClick={() => {
-                    void handleTranscript(item);
-                  }}
-                  className="px-3 py-1.5 rounded-full text-xs border border-white/20 bg-white/10 text-white hover:border-[#f59e0b]/70 hover:shadow-[0_0_14px_rgba(245,158,11,0.28)] disabled:opacity-50 transition-all"
-                >
-                  {item}
-                </button>
-              ))
-            ) : null}
-          </div>
+        <div className="px-4 py-4 border-t border-white/10">
+          <div className="flex flex-col items-center gap-3">
+            <button
+              type="button"
+              onClick={handleMicClick}
+              disabled={state === "processing" || isRecording}
+              aria-label={copy.micControl}
+              aria-pressed={state === "listening"}
+              className={`relative w-28 h-28 rounded-full border text-white grid place-items-center disabled:opacity-55 transition-all duration-300 ${
+                state === "listening"
+                  ? "border-amber-300/60 bg-[#111827] shadow-[0_0_40px_rgba(251,191,36,0.45)] scale-105 animate-[pulse_1.6s_ease-in-out_infinite]"
+                  : "border-white/10 bg-[#111827] shadow-[0_8px_24px_rgba(0,0,0,0.35)]"
+              }`}
+            >
+              {state === "listening" ? (
+                <span className="pointer-events-none absolute inset-0 rounded-full border border-amber-300/35 animate-ping" />
+              ) : null}
+              <Mic className="w-12 h-12" />
+            </button>
 
-          <div className="rounded-2xl border border-white/15 bg-white/[0.08] backdrop-blur-xl px-4 py-3 min-h-[84px] animate-[fadeIn_320ms_ease-out] shadow-[0_10px_30px_rgba(0,0,0,0.22)]">
-            <p className="text-[11px] uppercase tracking-wide text-gray-300 mb-1.5 font-semibold">
-              {uiLanguage === "hi" ? "Assistant Reply" : "Assistant Reply"}
-            </p>
-            <p className="text-cyan-50 leading-relaxed text-[15px]" aria-live="polite">
-              {displayedAssistantText || (uiLanguage === "hi" ? "यहाँ आपका सहायक उत्तर दिखाई देगा।" : "Your assistant response will appear here.")}
-            </p>
-          </div>
+            <p className="text-lg font-semibold" aria-live="polite" role="status">{statusWithEmoji}</p>
 
-          <div className="rounded-xl border border-white/10 bg-black/25 px-3 py-2.5 min-h-[56px]">
-            <p className="text-[11px] uppercase tracking-wide text-gray-400 mb-1">
-              {uiLanguage === "hi" ? "आपने कहा" : "You Said"}
-            </p>
-            <p className="text-white text-sm">{transcriptLive || transcriptFinal || (uiLanguage === "hi" ? "आपकी आवाज़ यहाँ दिखाई देगी" : "Your speech will appear here")}</p>
-          </div>
-
-          <div className="rounded-xl border border-white/10 bg-black/20 px-3 py-2.5">
-            <p className="text-[11px] uppercase tracking-wide text-gray-400 mb-2">
-              {uiLanguage === "hi" ? "वॉइस समस्या? टेक्स्ट से लिखें" : "Voice unavailable? Type your message"}
-            </p>
-            <div className="flex gap-2">
-              <input
-                value={textFallback}
-                onChange={(event) => setTextFallback(event.target.value)}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter") {
-                    event.preventDefault();
-                    submitFallbackText();
-                  }
-                }}
-                placeholder={uiLanguage === "hi" ? "यहाँ लिखें..." : "Type here..."}
-                className="flex-1 rounded-xl bg-[#0f172a] border border-white/15 px-3 py-2 text-sm outline-none focus:border-cyan-300/70"
-                aria-label={uiLanguage === "hi" ? "टेक्स्ट इनपुट" : "Text input"}
-              />
-              <button
-                type="button"
-                onClick={submitFallbackText}
-                disabled={state === "processing" || !textFallback.trim()}
-                className="px-3 py-2 rounded-xl text-xs font-semibold border border-cyan-300/40 bg-cyan-500/15 text-cyan-100 disabled:opacity-50"
-              >
-                {uiLanguage === "hi" ? "भेजें" : "Send"}
-              </button>
+            <div className="w-full max-w-xl rounded-xl bg-white/5 border border-white/10 p-3 animate-[fadeIn_220ms_ease-out]">
+              <p className="text-[11px] uppercase tracking-[0.12em] text-amber-100/80">{copy.liveTranscript}</p>
+              <p className="mt-1 text-sm text-gray-100 min-h-[1.5rem]" aria-live="polite">
+                {transcriptLine || copy.speechWillAppear}
+              </p>
             </div>
           </div>
+        </div>
 
-          <ConversationHistory history={conversationHistory} uiLanguage={uiLanguage} />
+        <div className="px-4 pb-5">
+          <div className="flex gap-2">
+            <input
+              value={textFallback}
+              onChange={(event) => setTextFallback(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  submitFallbackText();
+                }
+              }}
+              placeholder={copy.typeHere}
+              className="flex-1 h-12 rounded-xl bg-white/5 border border-white/10 px-3 text-base text-white placeholder:text-gray-400 outline-none focus:border-amber-300/50"
+              aria-label={copy.textInput}
+            />
+            <button
+              type="button"
+              onClick={submitFallbackText}
+              disabled={state === "processing" || !textFallback.trim()}
+              className="h-12 px-4 rounded-xl text-sm font-semibold border border-white/10 bg-white/5 hover:bg-white/10 text-white disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {copy.send}
+            </button>
+          </div>
 
           {effectiveErrorText ? (
-            <div className="rounded-xl border border-red-300/30 bg-red-500/10 px-3 py-2 text-red-200 text-sm animate-[fadeIn_220ms_ease-out]">
+            <div className="mt-3 rounded-xl border border-red-300/30 bg-red-500/10 px-3 py-2 text-red-200 text-sm">
               <p>{effectiveErrorText}</p>
               <button
                 type="button"
                 onClick={retryLast}
-                className="mt-2 rounded-full border border-red-200/40 px-3 py-1 text-xs font-semibold hover:bg-red-400/10"
+                className="mt-2 rounded-xl border border-white/10 bg-white/5 hover:bg-white/10 px-3 py-1 text-xs font-semibold"
               >
-                {uiLanguage === "hi" ? "फिर से कोशिश करें" : "Try again"}
+                {copy.retry}
               </button>
             </div>
           ) : null}
-
         </div>
       </div>
-      <DebugPanel />
+      <audio ref={audioRef} className="hidden" playsInline crossOrigin="anonymous" />
     </div>
   );
 };

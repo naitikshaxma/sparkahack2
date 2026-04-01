@@ -4,28 +4,27 @@ import path from "path";
 
 export default defineConfig(({ command, mode }) => {
   const env = loadEnv(mode, process.cwd(), "");
-  const backendTarget = env.VITE_DEV_BACKEND_URL || env.VITE_API_BASE_URL || env.VITE_BACKEND_URL || "";
+  const backendTarget = env.VITE_DEV_BACKEND_URL || env.VITE_API_BASE_URL || env.VITE_BACKEND_URL || "http://127.0.0.1:8000";
   const devPort = Number(env.VITE_DEV_PORT) || 5173;
-
-  if (command === "serve" && !backendTarget) {
-    throw new Error("VITE_DEV_BACKEND_URL is required to proxy /api requests in dev.");
-  }
+  const proxyConfig = backendTarget
+    ? {
+      "/api": {
+        target: backendTarget,
+        changeOrigin: true,
+      },
+      "/health": {
+        target: backendTarget,
+        changeOrigin: true,
+      },
+    }
+    : undefined;
 
   return {
     server: command === "serve"
       ? {
         host: "::",
         port: devPort,
-        proxy: {
-          "/api": {
-            target: backendTarget,
-            changeOrigin: true,
-          },
-          "/health": {
-            target: backendTarget,
-            changeOrigin: true,
-          },
-        },
+        proxy: proxyConfig,
         hmr: {
           overlay: false,
         },

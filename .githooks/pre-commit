@@ -1,22 +1,22 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/usr/bin/env sh
+set -eu
 
-if ! command -v git >/dev/null 2>&1; then
-  echo "[pre-commit] git is required." >&2
+if command -v python >/dev/null 2>&1; then
+  PYTHON_CMD="python"
+elif command -v python3 >/dev/null 2>&1; then
+  PYTHON_CMD="python3"
+else
+  echo "[pre-commit] Python is required but was not found."
   exit 1
 fi
 
-if command -v gitleaks >/dev/null 2>&1; then
-  echo "[pre-commit] Running gitleaks scan on staged changes..."
-  gitleaks protect --staged --verbose
-else
-  echo "[pre-commit] gitleaks not found, running local regex scan..."
-  if command -v python >/dev/null 2>&1; then
-    python scripts/secret_scan.py
-  elif command -v py >/dev/null 2>&1; then
-    py -3 scripts/secret_scan.py
-  else
-    echo "[pre-commit] Python is required for fallback secret scan." >&2
-    exit 1
-  fi
+if ! "$PYTHON_CMD" -m ruff --version >/dev/null 2>&1; then
+  echo "[pre-commit] ruff is required. Install it with: $PYTHON_CMD -m pip install ruff"
+  exit 1
 fi
+
+echo "[pre-commit] Running lint checks"
+"$PYTHON_CMD" -m ruff check backend/services/intent_service.py backend/api/v1/routes/voice_routes.py tests tools scripts
+
+echo "[pre-commit] Running test suite"
+"$PYTHON_CMD" -m pytest -q

@@ -7,29 +7,25 @@ interface QuickActionsProps {
   onSelect: (value: string) => void;
 }
 
+const DEFAULT_FIXED_ACTIONS: QuickAction[] = [
+  { label: "Apply kaise kare?", value: "Apply kaise kare?" },
+  { label: "Kitna paisa milega?", value: "Kitna paisa milega?" },
+  { label: "Documents kya chahiye?", value: "Documents kya chahiye?" },
+];
+
 const QuickActions = ({ uiLanguage, actions, disabled = false, onSelect }: QuickActionsProps) => {
-  const fallbackActions: QuickAction[] = uiLanguage === "hi"
-    ? [
-        { label: "पात्रता बताएं", value: "show_eligibility" },
-        { label: "और जानकारी", value: "more_info" },
-        { label: "आवेदन शुरू करें", value: "start_application" },
-      ]
-    : [
-        { label: "Show eligibility", value: "show_eligibility" },
-        { label: "More info", value: "more_info" },
-        { label: "Start application", value: "start_application" },
-      ];
-  const dynamicActions = actions && actions.length > 0 ? actions : fallbackActions;
+  const resolvedActions = actions && actions.length > 0 ? actions : DEFAULT_FIXED_ACTIONS;
 
   return (
-    <div className="flex flex-wrap gap-2">
-      {dynamicActions.map((action) => (
+    <div className="flex flex-wrap gap-2 md:gap-3">
+      {resolvedActions.map((action) => (
         <button
           key={`${action.value}-${action.label}`}
           type="button"
           disabled={disabled}
           onClick={() => onSelect(action.value)}
-          className="px-3 py-1.5 rounded-full text-xs border border-white/25 bg-white/10 text-white hover:border-yellow-300/70 disabled:opacity-50"
+          aria-label={`${uiLanguage === "hi" ? "त्वरित प्रश्न" : "Quick query"}: ${action.label}`}
+          className="px-4 py-3 rounded-2xl text-sm md:text-base font-semibold border border-white/25 bg-white/10 text-white hover:border-yellow-300/70 disabled:opacity-50"
         >
           {action.label}
         </button>

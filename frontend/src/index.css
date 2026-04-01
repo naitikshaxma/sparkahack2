@@ -6,33 +6,33 @@
 
 @layer base {
   :root {
-    --background: 40 33% 96%;
-    --foreground: 222 47% 11%;
+    --background: 0 0% 5%;
+    --foreground: 0 0% 98%;
 
-    --card: 0 0% 100%;
-    --card-foreground: 222 47% 11%;
+    --card: 0 0% 10%;
+    --card-foreground: 0 0% 96%;
 
-    --popover: 0 0% 100%;
-    --popover-foreground: 222 47% 11%;
+    --popover: 0 0% 10%;
+    --popover-foreground: 0 0% 96%;
 
-    --primary: 222 70% 33%;
-    --primary-foreground: 0 0% 100%;
+    --primary: 45 93% 47%;
+    --primary-foreground: 0 0% 10%;
 
-    --secondary: 40 30% 92%;
-    --secondary-foreground: 222 47% 11%;
+    --secondary: 0 0% 14%;
+    --secondary-foreground: 0 0% 95%;
 
-    --muted: 40 20% 90%;
-    --muted-foreground: 222 20% 45%;
+    --muted: 0 0% 18%;
+    --muted-foreground: 0 0% 60%;
 
-    --accent: 174 85% 32%;
-    --accent-foreground: 0 0% 100%;
+    --accent: 45 90% 50%;
+    --accent-foreground: 0 0% 10%;
 
     --destructive: 0 72% 51%;
     --destructive-foreground: 0 0% 100%;
 
-    --border: 40 15% 85%;
-    --input: 40 15% 85%;
-    --ring: 222 70% 33%;
+    --border: 0 0% 20%;
+    --input: 0 0% 20%;
+    --ring: 45 90% 50%;
 
     --radius: 0.75rem;
   }
@@ -46,7 +46,7 @@
   }
 
   body {
-    @apply bg-black text-foreground antialiased;
+    @apply bg-[#0b0b0b] text-white antialiased;
     font-family: 'Inter', system-ui, sans-serif;
     overflow-x: hidden;
     line-height: 1.5;
@@ -85,29 +85,29 @@
     content: '';
     @apply absolute top-0 left-0 right-0;
     height: 4px;
-    background: var(--card-accent, #1e3a8a);
+    background: var(--card-accent, #f59e0b);
   }
 
   /* Back button — light theme */
   .back-button {
     @apply flex items-center gap-2 px-4 py-2 rounded-full;
-    @apply text-indigo bg-white border border-gray-200;
+    @apply text-gray-300 bg-white/5 border border-white/10;
     @apply transition-all duration-200;
-    @apply hover:bg-gray-50 hover:shadow-sm;
+    @apply hover:bg-white/10 hover:shadow-sm;
     font-family: 'DM Sans', sans-serif;
   }
 
   /* Mic button — light theme */
   .mic-button {
     @apply relative rounded-full;
-    background: linear-gradient(135deg, #1e3a8a 0%, #2d4ea1 100%);
-    box-shadow: 0 8px 32px rgba(30, 58, 138, 0.25),
+    background: linear-gradient(135deg, #f59e0b 0%, #fbbf24 100%);
+    box-shadow: 0 8px 32px rgba(245, 158, 11, 0.25),
       0 4px 16px rgba(0, 0, 0, 0.1);
   }
 
   .mic-button.listening {
-    background: linear-gradient(135deg, #0d9488 0%, #14b8a6 100%);
-    box-shadow: 0 8px 32px rgba(13, 148, 136, 0.3),
+    background: linear-gradient(135deg, #fbbf24 0%, #f59e0b 100%);
+    box-shadow: 0 8px 32px rgba(245, 158, 11, 0.3),
       0 4px 16px rgba(0, 0, 0, 0.1);
   }
 }
@@ -152,7 +152,8 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  background: #000000;
+  background: linear-gradient(180deg, #0B0B0B 0%, #020202 100%);
+  overflow: hidden;
   transition: opacity 500ms ease-in-out;
 }
 
@@ -198,6 +199,18 @@
   font-size: clamp(1.75rem, 4vw, 2.75rem);
   font-weight: 700;
   color: #f59e0b;
+}
+
+@keyframes sparkleFloat {
+  0%,
+  100% {
+    transform: translate3d(0, 0, 0) scale(0.9);
+    opacity: 0.3;
+  }
+  50% {
+    transform: translate3d(10px, -18px, 0) scale(1.2);
+    opacity: 0.8;
+  }
 }
 
 .intro-language-english {

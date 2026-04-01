@@ -1,27 +1,17 @@
 import re
 import unicodedata
+import logging
 from dataclasses import dataclass
 from typing import List, Optional
 
 
+logger = logging.getLogger(__name__)
+
+
 PHRASE_MAP = {
-    "प्रधानमंत्री किसान सम्मान निधि योजना": "pm kisan scheme",
-    "प्रधानमंत्री किसान योजना": "pm kisan scheme",
-    "पी एम किसान योजना": "pm kisan scheme",
-    "पीएम किसान योजना": "pm kisan scheme",
     "पी एम": "pm",
     "पीएम": "pm",
     "p m": "pm",
-    "pm kisan yojana": "pm kisan scheme",
-    "kisan yojana": "kisan scheme",
-    "आयुष्मान भारत योजना": "ayushman bharat scheme",
-    "आयुष्मान भारत": "ayushman bharat",
-    "प्रधानमंत्री आवास योजना": "pmay scheme",
-    "आवास योजना": "housing scheme",
-    "वृद्धा पेंशन": "old age pension",
-    "राशन कार्ड योजना": "ration card scheme",
-    "राशन कार्ड": "ration card",
-    "راشن کارڈ": "ration card",
 }
 
 WORD_MAP = {
@@ -34,11 +24,11 @@ WORD_MAP = {
     "kisaan": "kisan",
     "kissan": "kisan",
     "kisan": "kisan",
-    "योजना": "scheme",
-    "योजनाएं": "scheme",
-    "योजनाओं": "scheme",
-    "yojana": "scheme",
-    "yojna": "scheme",
+    "योजना": "yojana",
+    "योजनाएं": "yojana",
+    "योजनाओं": "yojana",
+    "yojana": "yojana",
+    "yojna": "yojana",
     "scheme": "scheme",
     "loan": "loan",
     "rin": "loan",
@@ -122,6 +112,102 @@ HINDI_SIGNAL_TOKENS = {
 }
 
 
+_NOISE_PUNCT_RE = re.compile(r"[^\w\s\u0900-\u097f]")
+_MULTI_SPACE_RE = re.compile(r"\s+")
+_MULTI_PUNCT_RE = re.compile(r"([.!?।])\1+")
+_PUNCT_SPLIT_RE = re.compile(r"([.!?।])")
+_PM_VARIANT_RE = re.compile(r"^p+m+$")
+_KISAN_VARIANT_RE = re.compile(r"^k(?:i|ee)?s+h?a+a?n$")
+_YOJANA_VARIANT_RE = re.compile(r"^yojna+a*$|^yojan+a+$|^yojana+a*$")
+
+
+TOKEN_MAP = {
+    "पीएम": "pm",
+    "पी": "pm",
+    "एम": "pm",
+    "p": "p",
+    "m": "m",
+    "प्रधानमंत्री": "pradhanmantri",
+    "kishan": "kisan",
+    "kisaan": "kisan",
+    "kissan": "kisan",
+    "किसान": "kisan",
+    "किसानो": "kisan",
+    "किसानों": "kisan",
+    "yojna": "yojana",
+    "yojnaa": "yojana",
+    "yojanaa": "yojana",
+    "योजना": "yojana",
+    "आवेदन": "apply",
+    "पात्र": "eligible",
+    "कैसे": "how",
+    "क्या": "kya",
+    "है": "hai",
+    "मुझे": "mujhe",
+    "करना": "karna",
+}
+
+
+def _normalize_token(token: str) -> str:
+    current = str(token or "").strip()
+    if not current:
+        return ""
+    if current in {".", "?", "!", "।"}:
+        return current
+
+    mapped = TOKEN_MAP.get(current, current)
+    if _PM_VARIANT_RE.fullmatch(mapped):
+        return "pm"
+    if _KISAN_VARIANT_RE.fullmatch(mapped):
+        return "kisan"
+    if _YOJANA_VARIANT_RE.fullmatch(mapped):
+        return "yojana"
+    return mapped
+
+
+def _normalize_token_sequence(tokens: List[str]) -> List[str]:
+    normalized: List[str] = []
+    idx = 0
+    while idx < len(tokens):
+        token = _normalize_token(tokens[idx])
+        if not token:
+            idx += 1
+            continue
+
+        # Token-level merge for split PM forms: "p m" and "पी एम".
+        if idx + 1 < len(tokens):
+            nxt = _normalize_token(tokens[idx + 1])
+            if (token == "p" and nxt == "m") or (token == "pi" and nxt == "em"):
+                normalized.append("pm")
+                idx += 2
+                continue
+
+        # Keep punctuation deterministic by collapsing repeats.
+        if token in {".", "?", "!", "।"} and normalized and normalized[-1] == token:
+            idx += 1
+            continue
+
+        normalized.append(token)
+        idx += 1
+    return normalized
+
+
+def _join_tokens(tokens: List[str]) -> str:
+    if not tokens:
+        return ""
+
+    parts: List[str] = []
+    for token in tokens:
+        if token in {".", "?", "!", "।"}:
+            if parts:
+                parts[-1] = f"{parts[-1]}{token}"
+            else:
+                parts.append(token)
+            continue
+        parts.append(token)
+    return " ".join(parts).strip()
+
+
 @dataclass(frozen=True)
 class NormalizedInput:
     raw_text: str
@@ -173,10 +259,59 @@ def _tokenize_core(text: str) -> List[str]:
 
 
 def normalize_text(text: str) -> str:
-    raw = unicodedata.normalize("NFKC", str(text or "")).lower().strip()
-    if not raw:
-        return ""
-    return " ".join(_tokenize_core(raw)).strip()
+    try:
+        if text is None:
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("normalize_text received None input")
+            return ""
+
+        raw_input = str(text)
+        if not raw_input or not raw_input.strip():
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("normalize_text received empty input")
+            return ""
+
+        if len(raw_input) > 500:
+            raw_input = raw_input[:500]
+
+        # 1) Lowercase
+        lowered = unicodedata.normalize("NFKC", raw_input).lower()
+        # 2) Trim
+        lowered = lowered.strip()
+        # 3) Collapse spaces
+        lowered = _MULTI_SPACE_RE.sub(" ", lowered)
+        # 4) Remove punctuation noise
+        cleaned = _NOISE_PUNCT_RE.sub(" ", lowered)
+        cleaned = _MULTI_SPACE_RE.sub(" ", cleaned).strip()
+        if not cleaned:
+            return ""
+
+        # 5) Tokenize and normalize each token independently
+        tokens = cleaned.split(" ")
+        normalized_tokens: List[str] = []
+        for token in tokens:
+            normalized = _normalize_token(token)
+            if normalized:
+                normalized_tokens.append(normalized)
+
+        # 6) Rejoin deterministically
+        output = " ".join(normalized_tokens).strip()
+
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "normalize_text completed",
+                extra={"input_len": len(raw_input), "token_count": len(tokens), "output_len": len(output)},
+            )
+
+        return output
+    except Exception:
+        try:
+            fallback = str(text).lower().strip() if text is not None else ""
+            fallback = _NOISE_PUNCT_RE.sub(" ", fallback)
+            fallback = _MULTI_SPACE_RE.sub(" ", fallback).strip()
+            return fallback[:500]
+        except Exception:
+            return ""
 
 
 def normalize_for_intent(text: str, language_hint: Optional[str] = None) -> NormalizedInput:

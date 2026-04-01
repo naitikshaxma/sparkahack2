@@ -10,7 +10,7 @@ from .services.ocr_service import OcrService
 from .services.stt_service import STTService
 from .services.system_service import SystemService
 from .services.tts_service import TTSService
-from .validators.input_validator import InputValidator
+from backend.shared.validators.input_validator import InputValidator
 
 
 @dataclass(frozen=True)

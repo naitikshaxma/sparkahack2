@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -8,20 +9,58 @@ from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 
+from backend.core.logger import log_event
+
 
 # Load .env once for all backend modules.
-load_dotenv()
+load_dotenv(override=False)
+
+# Force local-only runtime mode to avoid environment-dependent startup failures.
+ENV = "development"
 
 
 _PLACEHOLDER_VALUES = {
     "",
     "replace-with-your-openai-key",
+    "replace-with-your-real-openai-key",
     "replace-with-strong-random-token",
     "change-me",
     "changeme",
     "default",
     "your-api-key",
 }
+
+_ALLOWED_ENVS = {
+    "development",
+    "production",
+    "staging",
+    "test",
+    "qa",
+    "uat",
+}
+
+_ENV_ALIASES = {
+    "dev": "development",
+    "local": "development",
+    "prod": "production",
+    "stage": "staging",
+}
+
+_WEAK_JWT_SECRETS = {
+    "secret",
+    "password",
+    "jwtsecret",
+    "jwt-secret",
+    "token",
+    "dev",
+    "test",
+    "default",
+}
+
+
+def has_valid_openai_key(key: str | None = None) -> bool:
+    # OpenAI is intentionally disabled; keep helper for backward compatibility.
+    return False
 
 
 def _as_bool(value: str | None, default: bool) -> bool:
@@ -50,6 +89,9 @@ def _is_placeholder(secret_value: str) -> bool:
     if value in _PLACEHOLDER_VALUES:
         return True
 
+    if re.search(r"x{6,}", value):
+        return True
+
     return (
         "replace" in value
         or "example" in value
@@ -58,8 +100,27 @@ def _is_placeholder(secret_value: str) -> bool:
     )
 
 
+def _is_weak_jwt_secret(secret_value: str) -> bool:
+    value = (secret_value or "").strip().lower()
+    if not value:
+        return True
+    if value in _WEAK_JWT_SECRETS:
+        return True
+    if len(set(value)) == 1:
+        return True
+    if re.fullmatch(r"(secret|password|jwtsecret|jwt-secret|changeme|default|token)+", value):
+        return True
+    return False
+
+
+def _normalize_env(value: str | None) -> str:
+    raw = (value or "development").strip().lower()
+    return _ENV_ALIASES.get(raw, raw)
+
+
 @dataclass(frozen=True)
 class Settings:
+    env: str
     openai_api_key: str
     openai_chat_model: str
     redis_url: str
@@ -87,11 +148,28 @@ class Settings:
     frontend_production_origin: str
     cors_allow_origins: tuple[str, ...]
 
+    def has_usable_openai_key(self) -> bool:
+        return False
+
+    def __getitem__(self, key: str):
+        mapping = {
+            "ENV": self.env,
+        }
+        if key in mapping:
+            return mapping[key]
+        raise KeyError(key)
+
     def validate_runtime(self) -> None:
-        if not self.openai_api_key:
-            raise RuntimeError("OPENAI_API_KEY is required for startup.")
-        if _is_placeholder(self.openai_api_key):
-            raise RuntimeError("OPENAI_API_KEY uses a placeholder/default value. Refusing startup.")
+        env = (self.env or "development").strip().lower()
+        if env not in _ALLOWED_ENVS:
+            allowed = ", ".join(sorted(_ALLOWED_ENVS))
+            raise RuntimeError(f"ENV must be one of: {allowed}.")
+        log_event(
+            "openai_disabled_local_runtime",
+            level="info",
+            endpoint="startup",
+            status="success",
+        )
 
         parsed = urlparse(self.redis_url)
         if parsed.scheme not in {"redis", "rediss"}:
@@ -117,15 +195,9 @@ class Settings:
                 raise RuntimeError("API_AUTH_KEY is required when ENABLE_API_KEY_AUTH=true.")
             if _is_placeholder(self.api_auth_key):
                 raise RuntimeError("API_AUTH_KEY uses a placeholder/default value. Refusing startup.")
-
-        if self.jwt_required_for_protected_routes:
-            if not self.jwt_secret_key:
-                raise RuntimeError("JWT_SECRET_KEY is required when JWT_REQUIRED_FOR_PROTECTED_ROUTES=true.")
-            if _is_placeholder(self.jwt_secret_key):
-                raise RuntimeError("JWT_SECRET_KEY uses a placeholder/default value. Refusing startup.")
+        # JWT is disabled for local-only runtime.
 
 
-@lru_cache(maxsize=1)
 def get_settings() -> Settings:
     raw_prefixes = (os.getenv("JWT_PROTECTED_PREFIXES") or "/api/private,/api/v1/private").strip()
     jwt_protected_prefixes = tuple(prefix.strip() for prefix in raw_prefixes.split(",") if prefix.strip())
@@ -142,13 +214,14 @@ def get_settings() -> Settings:
         )
 
     return Settings(
-        openai_api_key=(os.getenv("OPENAI_API_KEY") or "").strip(),
-        openai_chat_model=(os.getenv("OPENAI_CHAT_MODEL") or "gpt-4o-mini").strip(),
+        env=ENV,
+        openai_api_key="",
+        openai_chat_model="local",
         redis_url=(os.getenv("REDIS_URL") or "redis://localhost:6379/0").strip(),
         session_ttl_seconds=_as_int("SESSION_TTL_SECONDS", 86400),
-        model_path=Path(os.getenv("MODEL_PATH", "./models/intent")).resolve(),
-        hf_intent_model_id=(os.getenv("HF_INTENT_MODEL_ID") or "").strip(),
-        whisper_model_size=(os.getenv("WHISPER_MODEL_SIZE") or "base").strip(),
+        model_path=Path(os.getenv("MODEL_PATH", "./models/intent_model_distilbert")).resolve(),
+        hf_intent_model_id=(os.getenv("HF_INTENT_MODEL_ID") or "distilbert-base-uncased").strip(),
+        whisper_model_size=(os.getenv("WHISPER_MODEL_SIZE") or "medium").strip(),
         response_tone=(os.getenv("RESPONSE_TONE") or "assistant-like").strip().lower(),
         max_text_input_chars=_as_int("MAX_TEXT_INPUT_CHARS", 500),
         max_session_id_chars=_as_int("MAX_SESSION_ID_CHARS", 64),
@@ -159,13 +232,24 @@ def get_settings() -> Settings:
         trust_proxy_headers=_as_bool(os.getenv("TRUST_PROXY_HEADERS"), False),
         enable_api_key_auth=_as_bool(os.getenv("ENABLE_API_KEY_AUTH"), False),
         api_auth_key=(os.getenv("API_AUTH_KEY") or "").strip(),
-        database_url=(os.getenv("POSTGRES_URL") or os.getenv("DATABASE_URL") or "").strip(),
-        jwt_secret_key=(os.getenv("JWT_SECRET_KEY") or "dev-jwt-secret-change-me").strip(),
+        database_url=(os.getenv("DATABASE_URL") or "").strip(),
+        jwt_secret_key="",
         jwt_algorithm=(os.getenv("JWT_ALGORITHM") or "HS256").strip(),
         jwt_expiration_minutes=_as_int("JWT_EXPIRATION_MINUTES", 60),
-        jwt_required_for_protected_routes=_as_bool(os.getenv("JWT_REQUIRED_FOR_PROTECTED_ROUTES"), False),
-        jwt_protected_prefixes=jwt_protected_prefixes,
+        jwt_required_for_protected_routes=False,
+        jwt_protected_prefixes=tuple(),
         frontend_dev_origin=frontend_dev_origin,
         frontend_production_origin=frontend_production_origin,
         cors_allow_origins=cors_allow_origins,
     )
+
+
+if ENV == "production":
+    get_settings = lru_cache(maxsize=1)(get_settings)
+
+
+def reload_settings() -> None:
+    try:
+        get_settings.cache_clear()  # type: ignore[attr-defined]
+    except Exception:
+        pass

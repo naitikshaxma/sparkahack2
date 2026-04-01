@@ -1,29 +1,35 @@
-import hmac
+import importlib
 import hashlib
+import json
 import os
 import time
 import uuid
 import asyncio
+import logging
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from .auth import clear_current_user_id, decode_access_token, extract_bearer_token, set_current_user_id
-from backend.core.config import get_settings
+from backend.auth import clear_current_user_id, set_current_user_id
+from backend.core.config import get_settings, reload_settings
 from backend.infrastructure.database.connection import init_db
 from backend.core.logger import clear_request_context, configure_logging, log_event, log_exception, set_request_context
 from backend.core.metrics import record_error, record_request
-from .routes.auth_routes import router as auth_router
 from backend.api.v1.routes.intent import router as intent_router
 from backend.api.v1.routes.health import router as health_router
-from .routes.response_utils import standardized_error
-from .routes.system_routes import router as system_router
-from .routes.voice_routes import router as voice_router
+from backend.routes.response_utils import RESPONSE_REDACTION_SKIP_KEYS, standardized_error
+from backend.shared.security.privacy import redact_sensitive_payload
+from backend.api.v1.routes.system_routes import router as system_router
+from backend.api.v1.routes.voice_routes import router as voice_router
 from backend.api.v1.routes.voice_ws import router as voice_ws_router
-from backend.infrastructure.ml.rag_service import warmup_rag_resources
-from .utils.rate_limit import allow_request
+from backend.services.rag_service import get_scheme_registry_snapshot, warmup_rag_resources, warmup_scheme_registry_cache
+from backend.services.intent_service import get_intent_dataset_status, warmup_intent_dataset_cache
+from backend.shared.security.rate_limit import allow_request
 from backend.infrastructure.ml.whisper_service import warmup_whisper
 
 
@@ -31,6 +37,11 @@ def create_app() -> FastAPI:
     settings = get_settings()
     app = FastAPI(title="Voice OS Bharat")
     configure_logging()
+    startup_logger = logging.getLogger(__name__)
+
+    def _env_flag(name: str, default: str = "1") -> bool:
+        raw = (os.getenv(name) or default).strip().lower()
+        return raw not in {"0", "false", "no", "off"}
 
     max_concurrent = max(1, int((os.getenv("MAX_CONCURRENT_REQUESTS") or "50").strip() or "50"))
     request_timeout_seconds = max(1.0, float((os.getenv("REQUEST_TIMEOUT_SECONDS") or "30").strip() or "30"))
@@ -47,14 +58,29 @@ def create_app() -> FastAPI:
 
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=list(settings.cors_allow_origins),
+        allow_origins=[
+            "http://localhost:5173",
+            "http://127.0.0.1:5173",
+            "http://localhost:5174",
+            "http://127.0.0.1:5174",
+        ],
+        allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
     )
 
     @app.on_event("startup")
     def startup() -> None:
-        settings.validate_runtime()
+        reload_settings()
+        current_settings = get_settings()
+        log_event(
+            "startup_env",
+            endpoint="startup",
+            status="success",
+            env=current_settings["ENV"],
+        )
+        startup_logger.info("Local-only mode active: auth/OpenAI disabled")
+        current_settings.validate_runtime()
         try:
             init_db()
         except Exception as exc:
@@ -65,7 +91,7 @@ def create_app() -> FastAPI:
                 status="failure",
                 error_type=type(exc).__name__,
             )
-        warmup_rag = (os.getenv("RAG_WARMUP_ON_STARTUP") or "1").strip().lower() not in {"0", "false", "no", "off"}
+        warmup_rag = _env_flag("RAG_WARMUP_ON_STARTUP", "1")
         if warmup_rag:
             try:
                 warmup_rag_resources(precompute_embeddings=True)
@@ -77,21 +103,61 @@ def create_app() -> FastAPI:
                     status="failure",
                     error_type=type(exc).__name__,
                 )
-        warmup_whisper()
+        if _env_flag("WHISPER_WARMUP_ON_STARTUP", "0"):
+            try:
+                warmup_whisper()
+            except Exception as exc:
+                log_event(
+                    "whisper_warmup_failed",
+                    level="warning",
+                    endpoint="startup",
+                    status="failure",
+                    error_type=type(exc).__name__,
+                )
 
-        # Phase 9: Start stuck-job sweeper as a non-blocking background coroutine
-        try:
-            from backend.infrastructure.monitoring.sweeper import run_sweeper
-            asyncio.ensure_future(run_sweeper())
-            log_event("sweeper_started", level="info", endpoint="startup", status="success")
-        except Exception as exc:
-            log_event(
-                "sweeper_start_failed",
-                level="warning",
-                endpoint="startup",
-                status="failure",
-                error_type=type(exc).__name__,
-            )
+        if _env_flag("SCHEME_REGISTRY_WARMUP_ON_STARTUP", "1"):
+            try:
+                registry_snapshot = warmup_scheme_registry_cache() or {}
+                startup_logger.info("Chunks loaded: %s", int(registry_snapshot.get("chunk_rows", 0)))
+                startup_logger.info("Scheme rows loaded: %s", int(registry_snapshot.get("scheme_rows", 0)))
+            except Exception as exc:
+                log_event(
+                    "scheme_registry_warmup_failed",
+                    level="warning",
+                    endpoint="startup",
+                    status="failure",
+                    error_type=type(exc).__name__,
+                )
+
+        if _env_flag("INTENT_DATASET_WARMUP_ON_STARTUP", "1"):
+            try:
+                warmup_intent_dataset_cache(force=False)
+                intent_status = get_intent_dataset_status()
+                startup_logger.info("Intent rows loaded: %s", int(intent_status.get("row_count", 0)))
+            except Exception as exc:
+                log_event(
+                    "intent_dataset_warmup_failed",
+                    level="warning",
+                    endpoint="startup",
+                    status="failure",
+                    error_type=type(exc).__name__,
+                )
+
+        # Optional monitoring sweeper for non-MVP deployments.
+        if _env_flag("ENABLE_MONITORING_SWEEPER", "0"):
+            try:
+                sweeper_module = importlib.import_module("backend.infrastructure.monitoring.sweeper")
+                run_sweeper = getattr(sweeper_module, "run_sweeper")
+                asyncio.ensure_future(run_sweeper())
+                log_event("sweeper_started", level="info", endpoint="startup", status="success")
+            except Exception as exc:
+                log_event(
+                    "sweeper_start_failed",
+                    level="warning",
+                    endpoint="startup",
+                    status="failure",
+                    error_type=type(exc).__name__,
+                )
 
     def _extract_client_ip(request: Request) -> str:
         if settings.trust_proxy_headers:
@@ -106,21 +172,6 @@ def create_app() -> FastAPI:
                 return real_ip
 
         return request.client.host if request.client else "unknown"
-
-    def _extract_api_key(request: Request) -> str:
-        header_key = (request.headers.get("x-api-key") or "").strip()
-        if header_key:
-            return header_key
-
-        authorization = (request.headers.get("authorization") or "").strip()
-        if authorization.lower().startswith("bearer "):
-            return authorization[7:].strip()
-        return ""
-
-    def _api_key_fingerprint(api_key: str) -> str:
-        if not api_key:
-            return ""
-        return hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:16]
 
     def _enforce_request_size_limit(request: Request, client_ip: str, request_id: str) -> None:
         if not request.url.path.startswith("/api"):
@@ -150,23 +201,14 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=413, detail="Request payload too large.")
 
     def _require_api_key_if_enabled(request: Request) -> None:
-        if not request.url.path.startswith("/api"):
-            return
-        if not settings.enable_api_key_auth:
-            return
-
-        provided_key = _extract_api_key(request)
-        if not provided_key:
-            raise HTTPException(status_code=401, detail="Missing API key.")
-        if not hmac.compare_digest(provided_key, settings.api_auth_key):
-            raise HTTPException(status_code=403, detail="Invalid API key.")
+        # Auth is intentionally disabled in local-only runtime.
+        return
 
     def _check_rate_limit(request: Request, request_id: str) -> None:
         if not request.url.path.startswith("/api"):
             return
 
         client_ip = _extract_client_ip(request)
-        api_key = _extract_api_key(request)
         ip_allowed = allow_request(
             f"ip:{client_ip}",
             max_requests=settings.api_rate_limit_max_requests,
@@ -183,26 +225,6 @@ def create_app() -> FastAPI:
                 client_ip=client_ip,
             )
             raise HTTPException(status_code=429, detail="Too many requests. Please retry later.")
-
-        if api_key:
-            api_key_id = _api_key_fingerprint(api_key)
-            key_allowed = allow_request(
-                f"api_key:{api_key_id}",
-                max_requests=settings.api_key_rate_limit_max_requests,
-                window_seconds=settings.api_rate_limit_window_seconds,
-            )
-            if not key_allowed:
-                log_event(
-                    "security_request_rejected",
-                    level="warning",
-                    request_id=request_id,
-                    endpoint=request.url.path,
-                    status="failure",
-                    error_type="api_key_rate_limit_exceeded",
-                    client_ip=client_ip,
-                    api_key_id=api_key_id,
-                )
-                raise HTTPException(status_code=429, detail="Too many requests. Please retry later.")
 
     def _set_security_headers(response) -> None:
         response.headers["X-Content-Type-Options"] = "nosniff"
@@ -225,26 +247,11 @@ def create_app() -> FastAPI:
         is_api = request.url.path.startswith("/api")
         is_streaming = request.url.path in streaming_paths
 
-        token = extract_bearer_token(request.headers.get("authorization", ""))
-        authenticated_user_id = ""
-        if token:
-            try:
-                claims = decode_access_token(token, settings.jwt_secret_key, settings.jwt_algorithm)
-                authenticated_user_id = str(claims.get("sub") or "").strip()
-            except HTTPException:
-                authenticated_user_id = ""
+        authenticated_user_id = (request.headers.get("x-user-id") or "").strip()
 
         request.state.user_id = authenticated_user_id
         set_request_context(request_id, request.url.path, request.method, authenticated_user_id)
         set_current_user_id(authenticated_user_id)
-
-        requires_jwt = any(request.url.path.startswith(prefix) for prefix in settings.jwt_protected_prefixes)
-        if requires_jwt and not authenticated_user_id:
-            clear_current_user_id()
-            clear_request_context()
-            response = JSONResponse(status_code=401, content=standardized_error("Authentication required."), headers={"x-request-id": request_id})
-            _set_security_headers(response)
-            return response
 
         log_event(
             "request_start",
@@ -353,6 +360,15 @@ def create_app() -> FastAPI:
                 method=request.method,
                 user_id=authenticated_user_id,
             )
+            if isinstance(response, JSONResponse):
+                try:
+                    if response.body:
+                        body_payload = json.loads(response.body.decode(response.charset or "utf-8"))
+                        redacted = redact_sensitive_payload(body_payload, skip_keys=RESPONSE_REDACTION_SKIP_KEYS)
+                        response.body = response.render(redacted)
+                        response.headers["content-length"] = str(len(response.body))
+                except Exception:
+                    pass
             response.headers["x-request-id"] = request_id
             _set_security_headers(response)
             clear_request_context()
@@ -418,10 +434,12 @@ def create_app() -> FastAPI:
         clear_current_user_id()
         return response
 
-    # Versioned + legacy compatibility mounts.
-    app.include_router(auth_router, prefix="/api")
-    app.include_router(auth_router, prefix="/api/v1")
+    if settings.env != "production":
+        @app.get("/debug/schemes")
+        async def debug_schemes() -> dict:
+            return get_scheme_registry_snapshot()
 
+    # Versioned + legacy compatibility mounts.
     app.include_router(intent_router, prefix="/api")
     app.include_router(voice_router, prefix="/api")
 
@@ -429,6 +447,7 @@ def create_app() -> FastAPI:
     app.include_router(voice_router, prefix="/api/v1")
 
     app.include_router(system_router)
+    app.include_router(system_router, prefix="/api")
     app.include_router(system_router, prefix="/api/v1")
 
     # Phase 7: Async WebSocket pipeline (Redis-backed with sync fallback)
@@ -436,6 +455,8 @@ def create_app() -> FastAPI:
     app.include_router(voice_ws_router)  # also available at /ws/voice/{session_id}
 
     # Phase 9: Observability endpoints
+    app.include_router(health_router)
+    app.include_router(health_router, prefix="/api")
     app.include_router(health_router, prefix="/api/v1")
 
     return app

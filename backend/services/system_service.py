@@ -4,8 +4,8 @@ from backend.infrastructure.ml.bert_service import get_intent_model_status
 from backend.core.intent_analytics import get_intent_metrics
 from backend.core.logger import log_event
 from backend.core.metrics import get_metrics_snapshot, get_public_metrics
-from backend.infrastructure.ml.rag_service import get_rag_status
-from ..utils.session_manager import get_session_store_status
+from backend.services.rag_service import get_rag_status
+from ..infrastructure.session.session_store import get_session_store_status
 from backend.infrastructure.ml.whisper_service import get_whisper_status
 
 
@@ -40,7 +40,7 @@ class SystemService:
             },
             "ocr": {
                 "status": "ok",
-                "provider": "tesseract+openai",
+                "provider": "tesseract+local-parser",
             },
             "whisper": {
                 "model_name": whisper_status.get("model_name", "unknown"),

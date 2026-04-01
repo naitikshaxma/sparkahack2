@@ -1,13 +1,28 @@
+Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$repoRoot = Split-Path -Parent $PSScriptRoot
-Set-Location $repoRoot
+$repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
+$hookPath = Join-Path $repoRoot ".githooks/pre-commit"
 
-git config core.hooksPath .githooks
-Write-Host "Configured core.hooksPath=.githooks"
+if (-not (Test-Path $hookPath)) {
+    throw "Missing hook file: $hookPath"
+}
 
-if (Test-Path ".githooks\pre-commit") {
-  Write-Host "Pre-commit hook is ready."
-} else {
-  throw "Missing .githooks\pre-commit"
+Push-Location $repoRoot
+try {
+    $gitCmd = Get-Command git -ErrorAction Stop
+    & $gitCmd.Source config core.hooksPath ".githooks"
+
+    try {
+        & $gitCmd.Source update-index --chmod=+x .githooks/pre-commit | Out-Null
+    }
+    catch {
+        # This is best-effort on Windows filesystems.
+    }
+
+    Write-Host "Git hooks installed. core.hooksPath=.githooks"
+    Write-Host "Pre-commit will now block commits when lint or tests fail."
+}
+finally {
+    Pop-Location
 }

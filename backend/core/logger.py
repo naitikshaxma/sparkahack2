@@ -9,6 +9,7 @@ from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Any
 
+from backend.shared.security.privacy import redact_sensitive_data, redact_sensitive_payload
 
 _REQUEST_ID: ContextVar[str] = ContextVar("request_id", default="")
 _ENDPOINT: ContextVar[str] = ContextVar("endpoint", default="")
@@ -18,6 +19,43 @@ _USER_ID: ContextVar[str] = ContextVar("user_id", default="")
 
 _LOG_QUEUE: "queue.Queue[logging.LogRecord]" = queue.Queue(maxsize=20000)
 _QUEUE_LISTENER: logging.handlers.QueueListener | None = None
+_REDACTION_FACTORY_INSTALLED = False
+_ORIGINAL_LOG_RECORD_FACTORY = logging.getLogRecordFactory()
+_STANDARD_LOG_RECORD_ATTRS = set(_ORIGINAL_LOG_RECORD_FACTORY("", 0, "", 0, "", (), None).__dict__.keys())
+
+
+def _redacting_log_record_factory(*args: Any, **kwargs: Any) -> logging.LogRecord:
+    record = _ORIGINAL_LOG_RECORD_FACTORY(*args, **kwargs)
+    try:
+        message = record.getMessage()
+    except Exception:
+        message = str(record.msg)
+    record.msg = redact_sensitive_data(message)
+    record.args = ()
+
+    if record.exc_info:
+        try:
+            exc_text = "".join(traceback.format_exception(*record.exc_info))
+        except Exception:
+            exc_text = ""
+        record.exc_text = redact_sensitive_data(exc_text)
+        record.exc_info = None
+    if record.stack_info:
+        record.stack_info = redact_sensitive_data(str(record.stack_info))
+
+    for key, value in list(record.__dict__.items()):
+        if key in _STANDARD_LOG_RECORD_ATTRS or key in {"msg", "args", "message"}:
+            continue
+        record.__dict__[key] = redact_sensitive_payload(value)
+    return record
+
+
+def install_log_redaction() -> None:
+    global _REDACTION_FACTORY_INSTALLED
+    if _REDACTION_FACTORY_INSTALLED:
+        return
+    logging.setLogRecordFactory(_redacting_log_record_factory)
+    _REDACTION_FACTORY_INSTALLED = True
 
 
 def configure_logging() -> None:
@@ -26,6 +64,8 @@ def configure_logging() -> None:
     logger = logging.getLogger("voice_os")
     if _QUEUE_LISTENER is not None:
         return
+
+    install_log_redaction()
 
     stream_handler = logging.StreamHandler()
     stream_handler.setFormatter(logging.Formatter("%(message)s"))
@@ -88,6 +128,7 @@ def log_event(event: str, *, level: str = "info", **fields: Any) -> None:
     configure_logging()
     logger = logging.getLogger("voice_os")
     payload = _base_payload(event=event, **fields)
+    payload = redact_sensitive_payload(payload)
     message = json.dumps(payload, ensure_ascii=False)
 
     level_name = (level or "info").lower()
@@ -99,6 +140,10 @@ def log_event(event: str, *, level: str = "info", **fields: Any) -> None:
         logger.error(message)
     else:
         logger.info(message)
+
+
+def safe_log(message: str, *, level: str = "info", **fields: Any) -> None:
+    log_event("safe_log", level=level, status="success", message=message, **fields)
 
 
 def log_exception(error: Exception, *, safe_context: dict[str, Any] | None = None, **fields: Any) -> None:
@@ -114,3 +159,6 @@ def log_exception(error: Exception, *, safe_context: dict[str, Any] | None = Non
         error_type=type(error).__name__,
         **payload,
     )
+
+
+install_log_redaction()

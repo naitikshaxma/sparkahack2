@@ -20,6 +20,8 @@ export interface ConversationTurn {
   createdAt: number;
 }
 
+const MAX_CONVERSATION_TURNS = 5;
+
 interface VoiceStoreState {
   voiceState: VoiceState;
   transcriptLive: string;
@@ -158,7 +160,7 @@ export const useVoiceStore = create<VoiceStoreState & VoiceStoreActions>((set, g
   setDemoMode: (demoMode) => set({ demoMode }),
   addConversationTurn: (turn) =>
     set((state) => ({
-      conversationHistory: [...state.conversationHistory, turn].slice(-30),
+      conversationHistory: [...state.conversationHistory, turn].slice(-MAX_CONVERSATION_TURNS),
     })),
   updateConversationAssistantText: (turnId, assistantText) =>
     set((state) => ({

@@ -2,6 +2,7 @@ import json
 import time
 from typing import Any, Dict
 import asyncio
+import re
 
 try:
     import pytesseract  # type: ignore
@@ -10,34 +11,12 @@ except ImportError:  # pragma: no cover
     pytesseract = None  # type: ignore
     Image = None  # type: ignore
 
-try:
-    from openai import OpenAI  # type: ignore
-except Exception:  # pragma: no cover - optional dependency
-    OpenAI = None
-
-from backend.core.config import get_settings
 from backend.core.logger import log_event
 
-
-SETTINGS = get_settings()
-
-MODEL_NAME = SETTINGS.openai_chat_model
 SYSTEM_PROMPT = (
     "You are an OCR data extractor. Extract structured Aadhaar information from raw OCR text. "
     "Return ONLY valid JSON. If unsure, return null."
 )
-
-
-_client: Any | None = None
-
-
-def _get_client() -> Any:
-    global _client
-    if OpenAI is None:
-        raise RuntimeError("openai package is not installed")
-    if _client is None:
-        _client = OpenAI(api_key=SETTINGS.openai_api_key)
-    return _client
 
 
 def _empty_extraction() -> Dict[str, Any]:
@@ -55,8 +34,12 @@ def extract_text(image_path: str, timings: dict | None = None) -> str:
     log_event("ocr_extract_text_start", endpoint="ocr_service", status="success")
     # Requires system-level Tesseract installation and accessible PATH.
     try:
-        with Image.open(image_path) as img:
-            text = pytesseract.image_to_string(img)
+        if Image is None or pytesseract is None:
+            raise RuntimeError("OCR dependencies are not installed")
+        image_module: Any = Image
+        ocr_module: Any = pytesseract
+        with image_module.open(image_path) as img:
+            text = ocr_module.image_to_string(img)
         elapsed_ms = round((time.perf_counter() - start) * 1000.0, 2)
         if timings is not None:
             timings["ocr_text_extraction_ms"] = elapsed_ms
@@ -87,41 +70,25 @@ def extract_structured_data(ocr_text: str, timings: dict | None = None) -> Dict[
         return _empty_extraction()
 
     try:
-        response = _get_client().chat.completions.create(
-            model=MODEL_NAME,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": (
-                        "Extract this OCR text to JSON with keys exactly: "
-                        "full_name, aadhaar_number, date_of_birth, address, confidence.\n"
-                        f"OCR text:\n{ocr_text}"
-                    ),
-                },
-            ],
-            temperature=0,
-        )
-
-        parsed = json.loads(response.choices[0].message.content or "{}")
-        confidence_raw = parsed.get("confidence", 0.0)
-        try:
-            confidence = max(0.0, min(1.0, float(confidence_raw)))
-        except (TypeError, ValueError):
-            confidence = 0.0
+        text = str(ocr_text or "")
+        aadhaar_match = re.search(r"\b\d{4}\s?\d{4}\s?\d{4}\b", text)
+        dob_match = re.search(r"\b\d{2}[/-]\d{2}[/-]\d{4}\b", text)
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        name = lines[0] if lines else None
+        address = " ".join(lines[1:4]) if len(lines) > 1 else None
 
         result = {
-            "full_name": parsed.get("full_name"),
-            "aadhaar_number": parsed.get("aadhaar_number"),
-            "date_of_birth": parsed.get("date_of_birth"),
-            "address": parsed.get("address"),
-            "confidence": confidence,
+            "full_name": name,
+            "aadhaar_number": aadhaar_match.group(0).replace(" ", "") if aadhaar_match else None,
+            "date_of_birth": dob_match.group(0) if dob_match else None,
+            "address": address,
+            "confidence": 0.35,
+            "mode": "local",
         }
         elapsed_ms = round((time.perf_counter() - start) * 1000.0, 2)
         if timings is not None:
             timings["ocr_structuring_ms"] = elapsed_ms
-        log_event("ocr_structured_data_success", endpoint="ocr_service", status="success", response_time_ms=elapsed_ms)
+        log_event("ocr_structured_data_local", endpoint="ocr_service", status="success", response_time_ms=elapsed_ms)
         return result
     except Exception:
         elapsed_ms = round((time.perf_counter() - start) * 1000.0, 2)

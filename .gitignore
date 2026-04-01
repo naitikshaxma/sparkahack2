@@ -1,6 +1,7 @@
 # ── Python ────────────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
+*.pyc
 *.pyo
 *.pyd
 *.egg-info/
@@ -23,6 +24,7 @@ ENV/
 
 # ── Node / Frontend ───────────────────────────────────────────────────────────
 node_modules/
+frontend/node_modules/
 dist/
 build/
 .cache/
@@ -39,8 +41,7 @@ frontend/.env
 Thumbs.db
 
 # ── VS Code (keep project-level settings, ignore personal) ───────────────────
-.vscode/*
-!.vscode/settings.json
+.vscode/
 
 # ── Type checkers ─────────────────────────────────────────────────────────────
 .mypy_cache/
@@ -67,6 +68,14 @@ tools/*.bin
 
 # ── Generated snapshot files ──────────────────────────────────────────────────
 tree_output*.txt
+
+# ── Project generated artifacts ───────────────────────────────────────────────
+backend/data/processed/*.json
+frontend/dist/
+frontend/.fallback/
+intent_stability_*.json
+validation_report.json
+intent_full_validation_report.json
 
 # ── Datasets (large — use DVC or object storage) ─────────────────────────────
 datasets/

@@ -1,16 +1,28 @@
 from __future__ import annotations
 
 import os
+import logging
 from contextlib import contextmanager
 from typing import Iterator
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
+from dotenv import load_dotenv
+
+
+load_dotenv()
+
+logger = logging.getLogger(__name__)
+
+
+def _default_database_url() -> str:
+    return "sqlite:///./voice_os_phase5.db"
+
 
 DATABASE_URL = (
     (os.getenv("POSTGRES_URL") or "").strip()
     or (os.getenv("DATABASE_URL") or "").strip()
-    or "postgresql+psycopg2://postgres:postgres@localhost:5432/voice_os_bharat"
+    or _default_database_url()
 )
 
 Base = declarative_base()
@@ -40,9 +52,14 @@ SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expi
 
 def init_db() -> None:
     # Import models so SQLAlchemy metadata is populated before create_all.
-    from backend.models import db_models  # noqa: F401
+    from backend.infrastructure.database import db_models  # noqa: F401
 
-    Base.metadata.create_all(bind=engine)
+    try:
+        Base.metadata.create_all(bind=engine)
+        logger.warning("DB connected")
+    except Exception:
+        logger.exception("DB failed")
+        raise
 
 
 @contextmanager

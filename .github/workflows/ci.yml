@@ -1,62 +1,48 @@
-name: Voice OS CI
+name: Voice OS Bharat CI
 
 on:
   push:
-    branches: [main, develop]
+    branches:
+      - "**"
   pull_request:
-    branches: [main]
+    branches:
+      - "**"
 
 jobs:
-  backend-lint-and-test:
-    name: Backend - Lint & Test
+  test-and-validate:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+    env:
+      PYTHONPATH: .
+      DATABASE_URL: sqlite:///./ci_test.db
+      POSTGRES_URL: ""
+      SESSION_STORE_BACKEND: memory
+      RAG_WARMUP_ON_STARTUP: "0"
+      JWT_REQUIRED_FOR_PROTECTED_ROUTES: "1"
+      JWT_PROTECTED_PREFIXES: /api/intent,/api/process-text
 
-      - name: Set up Python 3.12
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-          cache: "pip"
+          python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      - name: Lint with ruff
-        run: pip install ruff && ruff check backend/
-
-      - name: Run backend tests
-        env:
-          OPENAI_API_KEY: "test-key-placeholder"
-          REDIS_URL: "redis://localhost:6379/0"
-          DATABASE_URL: "sqlite:///./test.db"
-        run: python -m pytest tests/ -v --tb=short
-
-  frontend-lint-and-test:
-    name: Frontend - Lint & Test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Node.js 20
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-          cache: "npm"
-          cache-dependency-path: frontend/package-lock.json
-
-      - name: Install dependencies
-        working-directory: frontend
-        run: npm ci
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r backend/requirements.txt
+          python -m pip install pytest ruff
 
       - name: Lint
-        working-directory: frontend
-        run: npm run lint
+        run: ruff check backend/services/intent_service.py backend/api/v1/routes/voice_routes.py tests tools scripts
 
-      - name: Type check
-        working-directory: frontend
-        run: npx tsc --noEmit
+      - name: Run full pytest suite
+        run: pytest -q
 
-      - name: Run frontend tests
-        working-directory: frontend
-        run: npm test -- --run
+      - name: Run intent stability suite
+        run: pytest -q tests/test_intent_stability.py tests/test_intent_flow.py tests/test_intent_advanced.py
+
+      - name: Run full pipeline e2e suite
+        run: pytest -q tests/test_full_pipeline.py

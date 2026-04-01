@@ -51,19 +51,26 @@ def ready() -> JSONResponse:
     # ── Redis ────────────────────────────────────────────────────────────────
     try:
         from backend.infrastructure.queue.redis_queue import _get_redis, queue_length
-        r = _get_redis()
-        if r is None:
-            checks["redis"] = {"status": "unavailable", "detail": "Redis client not connected"}
+    except ModuleNotFoundError:
+        checks["redis"] = {"status": "disabled", "detail": "Queue backend disabled for MVP"}
+    else:
+        try:
+            r = _get_redis()
+            if r is None:
+                checks["redis"] = {
+                    "status": "fallback_mode",
+                    "detail": "Redis unavailable; API fallback path is active",
+                    "queue_length": 0,
+                }
+            else:
+                r.ping()
+                q_len = queue_length()
+                checks["redis"] = {"status": "ok", "queue_length": q_len}
+                if q_len > 500:
+                    checks["redis"]["warning"] = "queue depth > 500"
+        except Exception as exc:
+            checks["redis"] = {"status": "error", "detail": str(exc)}
             healthy = False
-        else:
-            r.ping()
-            q_len = queue_length()
-            checks["redis"] = {"status": "ok", "queue_length": q_len}
-            if q_len > 500:
-                checks["redis"]["warning"] = "queue depth > 500"
-    except Exception as exc:
-        checks["redis"] = {"status": "error", "detail": str(exc)}
-        healthy = False
 
     # ── Worker heartbeats ─────────────────────────────────────────────────────
     try:
@@ -127,8 +134,21 @@ def prometheus_metrics() -> str:
       - voice_os_live_workers (gauge)
       ... and all other tracked counters
     """
-    from backend.infrastructure.monitoring.metrics import prometheus_text
-    base = prometheus_text()
+    try:
+        from backend.infrastructure.monitoring.metrics import prometheus_text
+        base = prometheus_text()
+    except ModuleNotFoundError:
+        base = (
+            "# HELP voice_os_metrics_disabled Monitoring module disabled\n"
+            "# TYPE voice_os_metrics_disabled gauge\n"
+            "voice_os_metrics_disabled 1\n"
+        )
+    except Exception:
+        base = (
+            "# HELP voice_os_metrics_error Monitoring exporter failed\n"
+            "# TYPE voice_os_metrics_error gauge\n"
+            "voice_os_metrics_error 1\n"
+        )
 
     # Append worker count as a gauge
     live = _count_live_workers()
