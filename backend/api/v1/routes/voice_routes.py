@@ -13,8 +13,13 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.responses import StreamingResponse
-from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel
+
+try:
+    from PIL import Image, UnidentifiedImageError
+except Exception:  # pragma: no cover - optional dependency for lightweight deploys
+    Image = None  # type: ignore[assignment]
+    UnidentifiedImageError = OSError  # type: ignore[assignment]
 
 from backend.domain.use_cases.voice.synthesize_tts import synthesize_tts as synthesize_tts_use_case
 from backend.domain.use_cases.voice.transcribe_audio import transcribe_audio as transcribe_audio_use_case
@@ -1414,6 +1419,17 @@ async def process_ocr(
         async with get_async_session_lock(resolved_session_id):
             session = get_session(resolved_session_id)
             session["language"] = request_language
+
+        if Image is None:
+            return standardized_success({
+                "session_id": resolved_session_id,
+                "response_text": _lang_text(request_language, "OCR is currently unavailable.", "OCR अभी उपलब्ध नहीं है।"),
+                "field_name": None,
+                "validation_passed": False,
+                "validation_error": "ocr_dependency_unavailable",
+                "ocr_data": fallback_data,
+                "session_complete": False,
+            })
 
         suffix = Path(file.filename or "document.png").suffix.lower() or ".png"
         content_type = (file.content_type or "").lower()

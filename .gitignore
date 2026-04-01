@@ -88,3 +88,12 @@ models/
 
 # ── Docker overrides ──────────────────────────────────────────────────────────
 docker-compose.override.yml
+
+# ── Railway deployment context slimming ───────────────────────────────────────
+*.db
+*.csv
+data/
+tools/
+scripts/
+frontend/
+**/__pycache__/

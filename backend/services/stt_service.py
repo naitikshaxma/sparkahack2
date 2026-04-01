@@ -6,6 +6,14 @@ from backend.core.logger import log_event
 from backend.infrastructure.ml.whisper_service import transcribe_audio
 
 DEFAULT_STT_TIMEOUT_SECONDS = float(os.getenv("STT_TIMEOUT_SECONDS", "30"))
+ALLOW_STT_FALLBACK = (os.getenv("ALLOW_STT_FALLBACK", "1").strip() not in {"0", "false", "False"})
+STT_FALLBACK_TRANSCRIPT = (os.getenv("STT_FALLBACK_TRANSCRIPT") or "Audio received").strip() or "Audio received"
+
+
+def _fallback_or_raise(exc: Exception) -> str:
+    if not ALLOW_STT_FALLBACK:
+        raise exc
+    return STT_FALLBACK_TRANSCRIPT
 
 
 class STTService:
@@ -32,7 +40,7 @@ class STTService:
                 error_type=type(exc).__name__,
                 response_time_ms=elapsed_ms,
             )
-            raise
+            return _fallback_or_raise(exc)
 
     async def transcribe_async(
         self,
@@ -70,7 +78,7 @@ class STTService:
                 status="timeout",
                 response_time_ms=elapsed_ms,
             )
-            raise RuntimeError(f"STT transcribe_async timed out after {effective_timeout}s")
+            return _fallback_or_raise(RuntimeError(f"STT transcribe_async timed out after {effective_timeout}s"))
         except Exception as exc:
             elapsed_ms = round((time.perf_counter() - start) * 1000.0, 2)
             if timings is not None:
@@ -83,4 +91,4 @@ class STTService:
                 error_type=type(exc).__name__,
                 response_time_ms=elapsed_ms,
             )
-            raise
+            return _fallback_or_raise(exc)

@@ -1,0 +1,12 @@
+*.db
+*.csv
+data/
+tools/
+scripts/
+frontend/
+node_modules/
+.git
+.gitignore
+**/__pycache__/
+*.log
+tests/

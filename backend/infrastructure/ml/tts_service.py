@@ -2,7 +2,13 @@ import base64
 import io
 import logging
 import re
-from gtts import gTTS
+import struct
+import wave
+
+try:
+    from gtts import gTTS
+except Exception:  # pragma: no cover - optional dependency for lightweight deploys
+    gTTS = None
 
 
 logger = logging.getLogger(__name__)
@@ -47,10 +53,26 @@ def generate_tts_bytes(text: str, language: str) -> bytes:
 
     lang = _resolve_language(language)
     logger.info("[lang-debug] tts_language=%s", lang)
+    if gTTS is None:
+        # Deterministic fallback: return a short silent WAV to keep API contract stable.
+        return _silent_wav_bytes(duration_ms=320)
+
     tts = gTTS(text=clean_text, lang=lang)
     fp = io.BytesIO()
     tts.write_to_fp(fp)
     return fp.getvalue()
+
+
+def _silent_wav_bytes(duration_ms: int = 300, sample_rate: int = 16000) -> bytes:
+    frame_count = max(1, int(sample_rate * max(50, duration_ms) / 1000))
+    pcm = struct.pack("<h", 0) * frame_count
+    buff = io.BytesIO()
+    with wave.open(buff, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(pcm)
+    return buff.getvalue()
 
 
 def generate_tts(text: str, language: str) -> str:
