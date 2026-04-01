@@ -7,6 +7,7 @@ import {
   getOrCreateSessionId,
   interruptTts,
   resetSession,
+  resolveApiUrl,
   setSessionId,
   synthesizeTts,
 } from "@/services/api";
@@ -14,6 +15,18 @@ import { useVoiceStore } from "@/store/voiceStore";
 import { detectTextLanguage, getGreeting } from "@/lib/languageUtils";
 import { logFrontendEvent } from "@/services/frontendTelemetry";
 import type { ConversationTurn } from "@/store/voiceStore";
+
+type BrowserSpeechRecognition = {
+  lang: string;
+  continuous: boolean;
+  interimResults: boolean;
+  onresult: ((event: any) => void) | null;
+  onend: (() => void) | null;
+  onerror: (() => void) | null;
+  onspeechend: (() => void) | null;
+  start: () => void;
+  stop: () => void;
+};
 
 
 interface Language {
@@ -56,6 +69,7 @@ const ROLE_ACTIVE_CONVERSATION_KEY = "voice_os_active_conversation_id";
 const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL || "";
 const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY || "";
 const CONVERSATION_SYNC_DEBOUNCE_MS = 800;
+const LEGACY_PLACEHOLDERS = ["aapki awaaz mil gayi", "your voice was transcribed"];
 
 type UiCopy = {
   appLabel: string;
@@ -452,13 +466,17 @@ const VoiceInteraction = ({ language, onBack }: VoiceInteractionProps) => {
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const mediaChunksRef = useRef<BlobPart[]>([]);
+  const recognitionRef = useRef<BrowserSpeechRecognition | null>(null);
+  const stopRequestedRef = useRef(false);
   const silenceTimerRef = useRef<number | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const currentTtsAudioRef = useRef<HTMLAudioElement | null>(null);
   const hasPlayedGreetingRef = useRef(false);
   const requestCounterRef = useRef(0);
   const processingRef = useRef(false);
   const lastTranscriptRef = useRef<{ text: string; ts: number }>({ text: "", ts: 0 });
   const activeTurnIdRef = useRef<string | null>(null);
+  const liveTranscriptRef = useRef("");
   const chatEndRef = useRef<HTMLDivElement | null>(null);
   const syncTimerRef = useRef<number | null>(null);
 
@@ -538,6 +556,10 @@ const VoiceInteraction = ({ language, onBack }: VoiceInteractionProps) => {
         text: (message as RoleMessage).text,
       }))
       .filter((message) => message.text.trim().length > 0)
+      .filter((message) => {
+        const normalized = message.text.trim().toLowerCase();
+        return !LEGACY_PLACEHOLDERS.some((phrase) => normalized.includes(phrase));
+      })
       .slice(-MAX_MESSAGES_PER_CONVERSATION);
   }, []);
 
@@ -633,7 +655,19 @@ const VoiceInteraction = ({ language, onBack }: VoiceInteractionProps) => {
       window.clearTimeout(silenceTimerRef.current);
       silenceTimerRef.current = null;
     }
+    stopRequestedRef.current = true;
     setIsRecording(false);
+
+    const recognition = recognitionRef.current;
+    if (recognition) {
+      try {
+        recognition.onend = null;
+        recognition.stop();
+      } catch {
+        // no-op
+      }
+      recognitionRef.current = null;
+    }
 
     const recorder = mediaRecorderRef.current;
     if (recorder) {
@@ -1010,6 +1044,10 @@ const VoiceInteraction = ({ language, onBack }: VoiceInteractionProps) => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [conversationHistory]);
 
+  useEffect(() => {
+    liveTranscriptRef.current = liveTranscript || "";
+  }, [liveTranscript]);
+
   const playAudioFromBase64 = useCallback(
     async (audioBase64?: string | null) => {
       if (!audioBase64) return;
@@ -1077,7 +1115,16 @@ const VoiceInteraction = ({ language, onBack }: VoiceInteractionProps) => {
 
       try {
         setVoiceState("speaking");
-        const response = await fetch("/api/tts", {
+        if (currentTtsAudioRef.current) {
+          try {
+            currentTtsAudioRef.current.pause();
+          } catch {
+            // no-op
+          }
+          currentTtsAudioRef.current = null;
+        }
+
+        const response = await fetch(resolveApiUrl("/tts"), {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -1092,31 +1139,58 @@ const VoiceInteraction = ({ language, onBack }: VoiceInteractionProps) => {
 
         const payload = await response.json() as {
           audio_base64?: string;
-          data?: { audio_base64?: string };
         };
-        const base64 = String(payload?.audio_base64 || payload?.data?.audio_base64 || "").trim();
+        console.log("TTS response:", payload);
+        const base64 = String(payload?.audio_base64 || "").trim();
         if (!base64) {
-          throw new Error("TTS response missing audio");
+          throw new Error("TTS response missing audio_base64");
         }
 
-        const audio = audioRef.current;
-        if (!audio) {
-          setVoiceState("idle");
-          return;
-        }
-
-        audio.pause();
-        audio.currentTime = 0;
         const src = base64.startsWith("data:audio") ? base64 : `data:audio/mp3;base64,${base64}`;
+        const audio = new Audio(src);
+        currentTtsAudioRef.current = audio;
         await new Promise<void>((resolve) => {
-          audio.src = src;
-          audio.load();
-          audio.onended = () => resolve();
-          audio.onerror = () => resolve();
-          audio.play().catch(() => resolve());
+          const speakFallback = () => {
+            try {
+              const utterance = new SpeechSynthesisUtterance(safeText);
+              utterance.lang = voiceLanguage === "hi" ? "hi-IN" : "en-US";
+              utterance.onend = () => resolve();
+              utterance.onerror = () => resolve();
+              window.speechSynthesis.cancel();
+              window.speechSynthesis.speak(utterance);
+            } catch {
+              resolve();
+            }
+          };
+
+          audio.onended = () => {
+            if (currentTtsAudioRef.current === audio) {
+              currentTtsAudioRef.current = null;
+            }
+            resolve();
+          };
+          audio.onerror = () => {
+            if (currentTtsAudioRef.current === audio) {
+              currentTtsAudioRef.current = null;
+            }
+            speakFallback();
+          };
+          audio.play().catch(() => {
+            if (currentTtsAudioRef.current === audio) {
+              currentTtsAudioRef.current = null;
+            }
+            speakFallback();
+          });
         });
       } catch {
-        setSimpleError();
+        try {
+          const utterance = new SpeechSynthesisUtterance(safeText);
+          utterance.lang = voiceLanguage === "hi" ? "hi-IN" : "en-US";
+          window.speechSynthesis.cancel();
+          window.speechSynthesis.speak(utterance);
+        } catch {
+          setSimpleError();
+        }
       } finally {
         setVoiceState("idle");
       }
@@ -1133,7 +1207,7 @@ const VoiceInteraction = ({ language, onBack }: VoiceInteractionProps) => {
       }
 
       try {
-        const response = await fetch("/api/intent", {
+        const response = await fetch(resolveApiUrl("/intent"), {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -1158,10 +1232,7 @@ const VoiceInteraction = ({ language, onBack }: VoiceInteractionProps) => {
           };
         };
 
-        const mergedResponse = [data?.message, data?.data?.message, data?.data?.summary, data?.data?.next_step]
-          .filter((part): part is string => Boolean(part && part.trim()))
-          .join("\n\n")
-          .trim() || "Something went wrong";
+        const mergedResponse = String(data?.message || "❌ केवल इन योजनाओं के बारे में पूछें (15 schemes only supported)").trim();
 
         setBackendResponse({
           session_id: getOrCreateSessionId(),
@@ -1186,7 +1257,23 @@ const VoiceInteraction = ({ language, onBack }: VoiceInteractionProps) => {
         markFirstResponse();
         await playTts(mergedResponse);
       } catch {
-        setSimpleError();
+        const errorMessage = "❌ केवल इन योजनाओं के बारे में पूछें (15 schemes only supported)";
+        setBackendResponse({
+          session_id: getOrCreateSessionId(),
+          response_text: errorMessage,
+          field_name: null,
+          validation_passed: false,
+          validation_error: errorMessage,
+          session_complete: false,
+          confidence: 1,
+          action: "error",
+          mode: "info",
+          scheme_details: null,
+        });
+        setResponseText(errorMessage);
+        updateConversationAssistantText(turnId, errorMessage);
+        markFirstResponse();
+        await playTts(errorMessage);
       }
     },
     [markFirstResponse, playTts, setBackendResponse, setResponseText, setSimpleError, updateConversationAssistantText, voiceLanguage],
@@ -1202,7 +1289,6 @@ const VoiceInteraction = ({ language, onBack }: VoiceInteractionProps) => {
         }
 
         setVoiceState("processing");
-        setLiveTranscript(voiceLanguage === "hi" ? "🎤 सुन रहा हूँ..." : "🎤 Listening...");
 
         const formData = new FormData();
         formData.append("audio", blob, "recording.webm");
@@ -1212,10 +1298,11 @@ const VoiceInteraction = ({ language, onBack }: VoiceInteractionProps) => {
         const controller = new AbortController();
         const timeoutId = window.setTimeout(() => controller.abort(), 15000);
 
-        const transcribeResponse = await fetch(`/api/transcribe?lang=${voiceLanguage}`, {
+        const transcribeResponse = await fetch(`${resolveApiUrl("/transcribe")}?lang=${voiceLanguage}`, {
           method: "POST",
           headers: {
             "x-language": voiceLanguage,
+            "x-live-transcript": liveTranscriptRef.current || "",
           },
           signal: controller.signal,
           body: formData,
@@ -1241,21 +1328,35 @@ const VoiceInteraction = ({ language, onBack }: VoiceInteractionProps) => {
             || "",
         ).trim();
 
-        if (!transcript) {
+        const resolvedTranscript = transcript || String(liveTranscriptRef.current || "").trim();
+        if (!resolvedTranscript) {
           throw new Error("No transcript returned");
         }
 
-        setFinalTranscript(transcript);
-        setLiveTranscript(transcript);
-        setDetectedLanguage(detectTextLanguage(transcript));
+        setFinalTranscript(resolvedTranscript);
+        setLiveTranscript(resolvedTranscript);
+        setDetectedLanguage(detectTextLanguage(resolvedTranscript));
         useVoiceStore.getState().replaceConversationHistory(
           useVoiceStore.getState().conversationHistory.map((turn) => (
-            turn.id === turnId ? { ...turn, userText: transcript } : turn
+            turn.id === turnId ? { ...turn, userText: resolvedTranscript } : turn
           )),
         );
-        await handleIntent(transcript, turnId);
+        await handleIntent(resolvedTranscript, turnId);
       } catch {
-        setSimpleError();
+        const liveFallback = String(liveTranscriptRef.current || "").trim();
+        if (liveFallback) {
+          setFinalTranscript(liveFallback);
+          setLiveTranscript(liveFallback);
+          setDetectedLanguage(detectTextLanguage(liveFallback));
+          useVoiceStore.getState().replaceConversationHistory(
+            useVoiceStore.getState().conversationHistory.map((turn) => (
+              turn.id === turnId ? { ...turn, userText: liveFallback } : turn
+            )),
+          );
+          await handleIntent(liveFallback, turnId);
+        } else {
+          setSimpleError();
+        }
       } finally {
         processingRef.current = false;
         setStreamDone(true);
@@ -1273,6 +1374,45 @@ const VoiceInteraction = ({ language, onBack }: VoiceInteractionProps) => {
     },
     [handleIntent, setDetectedLanguage, setFinalTranscript, setLiveTranscript, setSimpleError, setStreamDone, setVoiceState, voiceLanguage],
   );
+
+  const stopRecordingAndSend = useCallback((turnId: string | null) => {
+    if (!turnId || stopRequestedRef.current) {
+      return;
+    }
+    stopRequestedRef.current = true;
+
+    if (silenceTimerRef.current !== null) {
+      window.clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
+    }
+
+    const recognition = recognitionRef.current;
+    if (recognition) {
+      try {
+        recognition.onend = null;
+        recognition.stop();
+      } catch {
+        // no-op
+      }
+      recognitionRef.current = null;
+    }
+
+    setIsRecording(false);
+
+    const recorder = mediaRecorderRef.current;
+    if (recorder && recorder.state !== "inactive") {
+      try {
+        recorder.stop();
+        return;
+      } catch {
+        // no-op
+      }
+    }
+
+    void handleRecordedAudioStop(turnId).finally(() => {
+      endLatencyTracking();
+    });
+  }, [endLatencyTracking, handleRecordedAudioStop]);
 
   const handleTextQuery = useCallback(
     async (text: string) => {
@@ -1354,6 +1494,7 @@ const VoiceInteraction = ({ language, onBack }: VoiceInteractionProps) => {
     ensureActiveConversationId();
     beginLatencyTracking();
     processingRef.current = true;
+    stopRequestedRef.current = false;
     const requestId = ++requestCounterRef.current;
     const turnId = `turn-${Date.now()}-${requestId}`;
     activeTurnIdRef.current = turnId;
@@ -1369,12 +1510,26 @@ const VoiceInteraction = ({ language, onBack }: VoiceInteractionProps) => {
     setErrorState(null);
     setResponseText("");
     setBackendResponse(null);
-    setLiveTranscript(voiceLanguage === "hi" ? "🎤 सुन रहा हूँ..." : "🎤 Listening...");
+    setLiveTranscript("");
 
     navigator.mediaDevices
       .getUserMedia({ audio: true })
       .then((stream) => {
+        const SpeechRecognitionCtor = (
+          (window as Window & { SpeechRecognition?: new () => BrowserSpeechRecognition; webkitSpeechRecognition?: new () => BrowserSpeechRecognition }).SpeechRecognition
+          || (window as Window & { SpeechRecognition?: new () => BrowserSpeechRecognition; webkitSpeechRecognition?: new () => BrowserSpeechRecognition }).webkitSpeechRecognition
+        );
+        if (!SpeechRecognitionCtor) {
+          throw new Error("SpeechRecognition not supported");
+        }
+
+        const recognition = new SpeechRecognitionCtor();
+        recognition.lang = uiLanguage === "hi" ? "hi-IN" : "en-US";
+        recognition.continuous = false;
+        recognition.interimResults = true;
+
         const recorder = new MediaRecorder(stream);
+        recognitionRef.current = recognition;
         mediaRecorderRef.current = recorder;
         mediaStreamRef.current = stream;
         mediaChunksRef.current = [];
@@ -1393,6 +1548,42 @@ const VoiceInteraction = ({ language, onBack }: VoiceInteractionProps) => {
             }
           }
         }, 2500);
+
+        recognition.onresult = (event) => {
+          let transcript = "";
+
+          for (let i = event.resultIndex; i < event.results.length; i += 1) {
+            transcript += String(event.results[i]?.[0]?.transcript || "");
+          }
+
+          const cleanedTranscript = transcript.trim();
+          setLiveTranscript(cleanedTranscript);
+          liveTranscriptRef.current = cleanedTranscript;
+
+          if (silenceTimerRef.current !== null) {
+            window.clearTimeout(silenceTimerRef.current);
+          }
+          silenceTimerRef.current = window.setTimeout(() => {
+            stopRecordingAndSend(turnId);
+          }, 1400);
+        };
+
+        recognition.onspeechend = () => {
+          if (silenceTimerRef.current !== null) {
+            window.clearTimeout(silenceTimerRef.current);
+          }
+          silenceTimerRef.current = window.setTimeout(() => {
+            stopRecordingAndSend(turnId);
+          }, 700);
+        };
+
+        recognition.onend = () => {
+          stopRecordingAndSend(turnId);
+        };
+
+        recognition.onerror = () => {
+          stopRecordingAndSend(turnId);
+        };
 
         recorder.ondataavailable = (event: BlobEvent) => {
           if (event.data && event.data.size > 0) {
@@ -1419,6 +1610,7 @@ const VoiceInteraction = ({ language, onBack }: VoiceInteractionProps) => {
         };
 
         recorder.start();
+        recognition.start();
         setVoiceState("listening");
         logFrontendEvent("voice_state", { state: "listening" }, getOrCreateSessionId());
       })
@@ -1437,6 +1629,7 @@ const VoiceInteraction = ({ language, onBack }: VoiceInteractionProps) => {
     endLatencyTracking,
     ensureActiveConversationId,
     handleRecordedAudioStop,
+    stopRecordingAndSend,
     setErrorState,
     setBackendResponse,
     setFinalTranscript,
@@ -1449,6 +1642,7 @@ const VoiceInteraction = ({ language, onBack }: VoiceInteractionProps) => {
     state,
     stopAudio,
     stopListening,
+    uiLanguage,
     voiceLanguage,
   ]);
 
@@ -1459,7 +1653,7 @@ const VoiceInteraction = ({ language, onBack }: VoiceInteractionProps) => {
     logFrontendEvent("mic_tap", { state }, getOrCreateSessionId());
 
     if (state === "listening") {
-      stopListening();
+      stopRecordingAndSend(activeTurnIdRef.current);
       return;
     }
 
@@ -1474,7 +1668,7 @@ const VoiceInteraction = ({ language, onBack }: VoiceInteractionProps) => {
     }
 
     startListening();
-  }, [isRecording, setLiveTranscript, setVoiceState, startListening, state, stopAudio]);
+  }, [isRecording, startListening, state, stopRecordingAndSend]);
 
   const handleRestart = useCallback(async () => {
     stopListening();
@@ -1546,6 +1740,14 @@ const VoiceInteraction = ({ language, onBack }: VoiceInteractionProps) => {
     return () => {
       stopListening();
       stopAudio();
+      if (currentTtsAudioRef.current) {
+        try {
+          currentTtsAudioRef.current.pause();
+        } catch {
+          // no-op
+        }
+        currentTtsAudioRef.current = null;
+      }
       void interruptTts().catch(() => undefined);
     };
   }, [stopAudio, stopListening]);
@@ -1634,13 +1836,17 @@ const VoiceInteraction = ({ language, onBack }: VoiceInteractionProps) => {
 
   const conversationHistoryForDisplay = useMemo(() => {
     const clarificationHints = [
-      "clarify your request",
-      "please clarify",
       "कृपया अपना प्रश्न",
       "थोड़ा स्पष्ट",
     ];
 
     return conversationHistory.reduce<ConversationTurn[]>((acc, turn) => {
+      const userNorm = (turn.userText || "").trim().toLowerCase();
+      const assistantNormRaw = (turn.assistantText || "").trim().toLowerCase();
+      if (LEGACY_PLACEHOLDERS.some((phrase) => userNorm.includes(phrase) || assistantNormRaw.includes(phrase))) {
+        return acc;
+      }
+
       const prev = acc[acc.length - 1];
       const currAssistant = (turn.assistantText || "").trim();
       const prevAssistant = (prev?.assistantText || "").trim();
@@ -1917,6 +2123,9 @@ const VoiceInteraction = ({ language, onBack }: VoiceInteractionProps) => {
               <p className="mt-1 text-sm text-gray-100 min-h-[1.5rem]" aria-live="polite">
                 {transcriptLine || copy.speechWillAppear}
               </p>
+              <p className="mt-2 text-xs text-gray-300" aria-live="polite">📝 {liveTranscript || copy.speechWillAppear}</p>
+              <p className="mt-1 text-xs text-emerald-200" aria-live="polite">✔ {transcriptFinal || "-"}</p>
+              <p className="mt-1 text-xs text-amber-200" aria-live="polite">🤖 {(displayedAssistantText || "-").slice(0, 140)}</p>
             </div>
           </div>
         </div>

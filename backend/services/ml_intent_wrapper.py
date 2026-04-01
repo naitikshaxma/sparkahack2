@@ -9,13 +9,7 @@ from typing import Any, Dict, Optional
 
 from backend.services.helpers.response_builder import build_hackathon_response
 from backend.text_normalizer import normalize_text
-try:
-    from backend.data.scheme_data import SCHEME_DATA
-except Exception:
-    try:
-        from src.utils.scheme_data import SCHEME_DATA
-    except Exception:
-        from backend.src.utils.scheme_data import SCHEME_DATA
+from backend.data import SCHEME_DATA
 
 
 logger = logging.getLogger(__name__)
@@ -54,6 +48,24 @@ session_context = {
 CONTROLLED_SCHEME_CLARIFICATION = (
     "I currently provide detailed information for selected schemes. Please ask about a specific scheme like solar, housing, loan, etc."
 )
+
+
+def detect_scheme(text: str) -> Optional[str]:
+    normalized_text = str(text or "").strip().lower()
+    if not normalized_text:
+        return None
+
+    for key in SCHEME_DATA.keys():
+        normalized_key = str(key or "").strip().lower()
+        if normalized_key and normalized_key in normalized_text:
+            return normalized_key
+
+    if "किसान" in normalized_text:
+        return "pm kisan"
+    if "सोलर" in normalized_text:
+        return "solar rooftop subsidy"
+
+    return _resolve_scheme_from_static_data(normalized_text)
 
 
 def _fallback_payload(intent: str = "general_query") -> Dict[str, Any]:
@@ -868,7 +880,7 @@ def process_user_query(text: str, user_profile: dict = None, session_context: Op
 
         source = "ml"
         scheme_resolved_by_dataset = False
-        static_scheme = _resolve_scheme_from_static_data(normalized)
+        static_scheme = detect_scheme(normalized)
         remembered_scheme = None
         if isinstance(active_session_context, dict):
             remembered_scheme = _sanitize_scheme_name(active_session_context.get("last_scheme"))
@@ -998,7 +1010,7 @@ def process_user_query(text: str, user_profile: dict = None, session_context: Op
                     message=(
                         "कृपया योजना का नाम बताइए, फिर मैं पात्रता या आवेदन में मदद करूँगा।"
                         if response_language == "hi"
-                        else "Please share the scheme name so I can help with eligibility or application guidance."
+                        else "Please share the scheme name for eligibility or application guidance."
                     ),
                     summary=("फॉलो-अप प्रश्न के लिए योजना संदर्भ चाहिए" if response_language == "hi" else "Need scheme context for follow-up query"),
                     reason=("वर्तमान प्रश्न में योजना नाम नहीं मिला।" if response_language == "hi" else "Follow-up intent detected without a scheme in the current query."),
@@ -1026,6 +1038,10 @@ def process_user_query(text: str, user_profile: dict = None, session_context: Op
         scheme = _sanitize_scheme_name(scheme)
         canonical_scheme = _canonical_scheme_name(scheme)
         display_scheme = _scheme_display_name(canonical_scheme or scheme)
+        scheme_details = SCHEME_DATA.get(canonical_scheme, {}) if canonical_scheme else {}
+        scheme_summary_text = str((scheme_details or {}).get("summary") or "").strip()
+        scheme_eligibility_text = str((scheme_details or {}).get("eligibility") or "").strip()
+        scheme_steps_text = str((scheme_details or {}).get("steps") or "").strip()
 
         if intent in {"scheme_info", "eligibility", "eligibility_check", "application_help", "apply_help"}:
             if not canonical_scheme:
@@ -1046,7 +1062,7 @@ def process_user_query(text: str, user_profile: dict = None, session_context: Op
         _debug("process_user_query_intent", intent=intent, scheme_present=bool(scheme))
 
         if intent == "scheme_info" and canonical_scheme:
-            scheme_summary = (
+            scheme_summary = scheme_summary_text or (
                 f"{display_scheme} पात्र नागरिकों को सरकारी सहायता और योजना-विशेष लाभ प्रदान करती है।"
                 if response_language == "hi"
                 else f"{display_scheme} helps eligible citizens through government support and scheme-specific benefits."
@@ -1061,8 +1077,8 @@ def process_user_query(text: str, user_profile: dict = None, session_context: Op
                 data={
                     "scheme": display_scheme,
                     "summary": scheme_summary,
-                    "eligibility": "",
-                    "steps": "",
+                    "eligibility": scheme_eligibility_text,
+                    "steps": scheme_steps_text,
                 },
                 language=response_language,
             )
@@ -1079,7 +1095,7 @@ def process_user_query(text: str, user_profile: dict = None, session_context: Op
                     if response_language == "hi"
                     else f"Let me check your eligibility for {resolved_scheme}."
                 )
-            eligibility_text = (
+            eligibility_text = scheme_eligibility_text or (
                 (
                     f"{resolved_scheme} की पात्रता योजना नियमों पर निर्भर करती है, जैसे श्रेणी, आय सीमा और आवश्यक दस्तावेज़।"
                     if response_language == "hi"
@@ -1121,7 +1137,7 @@ def process_user_query(text: str, user_profile: dict = None, session_context: Op
                     if response_language == "hi"
                     else f"I can guide you on how to apply for {resolved_scheme}."
                 )
-            apply_steps = (
+            apply_steps = scheme_steps_text or (
                 "1) पात्रता जांचें। 2) आवश्यक दस्तावेज़ तैयार रखें। 3) आधिकारिक पोर्टल/कार्यालय में आवेदन जमा करें। 4) स्थिति ट्रैक करें और सत्यापन पूरा करें।"
                 if response_language == "hi"
                 else "1) Check eligibility. 2) Keep required documents ready. 3) Submit application on the official portal or office. 4) Track status and complete verification."
@@ -1160,10 +1176,30 @@ def process_user_query(text: str, user_profile: dict = None, session_context: Op
             _update_session_context(active_session_context, intent, _sanitize_scheme_name(scheme))
             return response
 
+        if canonical_scheme:
+            response = build_hackathon_response(
+                success=True,
+                response_type="scheme_info",
+                message=(f"{display_scheme} की जानकारी नीचे दी गई है।" if response_language == "hi" else f"Here are the details for {display_scheme}."),
+                summary=(f"{display_scheme} के लिए जानकारी मिली" if response_language == "hi" else f"Information found for {display_scheme}"),
+                reason=("योजना पहचान ली गई, इसलिए योजना-विशिष्ट उत्तर दिया गया।" if response_language == "hi" else "A supported scheme was detected, so a scheme-specific response was returned."),
+                next_step=("पात्रता या आवेदन प्रक्रिया के बारे में आगे पूछें।" if response_language == "hi" else "Ask next about eligibility or application process."),
+                data={
+                    "scheme": display_scheme,
+                    "summary": scheme_summary_text,
+                    "eligibility": scheme_eligibility_text,
+                    "steps": scheme_steps_text,
+                },
+                language=response_language,
+            )
+            response["confidence"] = _to_confidence_number(intent_data.get("confidence"))
+            _update_session_context(active_session_context, "scheme_info", canonical_scheme)
+            return response
+
         response = build_hackathon_response(
             success=True,
             response_type="general",
-            message=("कृपया अपना प्रश्न थोड़ा स्पष्ट करें।" if response_language == "hi" else "Can you please clarify your request?"),
+            message=("कृपया योजना का नाम बताएं।" if response_language == "hi" else "Please mention one supported scheme name."),
             summary=("मुझे थोड़ा स्पष्ट प्रश्न चाहिए" if response_language == "hi" else "I need a clearer request"),
             reason=("प्रश्न अभी किसी विशिष्ट इंटेंट से मेल नहीं खा रहा।" if response_language == "hi" else "The query does not map to a specific intent yet."),
             next_step=("पात्रता, आवेदन या योजना नाम के बारे में पूछें।" if response_language == "hi" else "Try asking about eligibility, application help, or a scheme name."),

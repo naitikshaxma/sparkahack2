@@ -29,7 +29,7 @@ RESPONSES = {
     },
     INTENT_APPLY_LOAN: {
         "en": {
-            "confirmation": "I can help with loan application information.",
+            "confirmation": "I can provide loan application information.",
             "explanation": "You can apply for personal, home, or business loans through eligible channels.",
             "next_step": "Would you like the required documents list?",
         },

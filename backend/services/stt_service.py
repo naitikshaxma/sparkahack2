@@ -7,7 +7,7 @@ from backend.infrastructure.ml.whisper_service import transcribe_audio
 
 DEFAULT_STT_TIMEOUT_SECONDS = float(os.getenv("STT_TIMEOUT_SECONDS", "30"))
 ALLOW_STT_FALLBACK = (os.getenv("ALLOW_STT_FALLBACK", "1").strip() not in {"0", "false", "False"})
-STT_FALLBACK_TRANSCRIPT = (os.getenv("STT_FALLBACK_TRANSCRIPT") or "Audio received").strip() or "Audio received"
+STT_FALLBACK_TRANSCRIPT = (os.getenv("STT_FALLBACK_TRANSCRIPT") or "Transcription unavailable").strip() or "Transcription unavailable"
 
 
 def _fallback_or_raise(exc: Exception) -> str:

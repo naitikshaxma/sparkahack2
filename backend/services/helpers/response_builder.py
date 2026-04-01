@@ -37,7 +37,7 @@ def format_response(text: str, language: str) -> str:
         replacements = {
             "Please provide": "Share",
             "Please tell me": "Tell me",
-            "I can help with this.": "I can help with that.",
+            "I can assist with this.": "I can support this.",
             "Do you want": "Would you like",
         }
         for source, target in replacements.items():
@@ -267,14 +267,21 @@ def _build_scheme_data_message(intent: str, scheme_name: str) -> Optional[str]:
     steps = str(scheme_info.get("steps") or "").strip()
 
     if intent == "scheme_info":
-        if summary:
-            lines = [segment.strip().rstrip(".") for segment in summary.replace("\n", ". ").split(". ") if segment.strip()]
-            if len(lines) >= 2:
-                return f"{lines[0]}.\n{lines[1]}."
-            if len(lines) == 1:
-                return f"{lines[0]}.\nThis scheme supports eligible beneficiaries through official government benefits."
+        if not summary and not eligibility and not steps:
             return None
-        return None
+        summary_parts = [segment.strip().rstrip(".") for segment in summary.replace("\n", ". ").split(". ") if segment.strip()]
+        eligibility_parts = [segment.strip().rstrip(".") for segment in eligibility.replace("\n", ". ").split(". ") if segment.strip()]
+        line_1 = summary_parts[0] if summary_parts else f"{scheme_name.title()} is a government support scheme"
+        benefit_line = ""
+        if len(summary_parts) > 1:
+            benefit_line = summary_parts[1]
+        elif eligibility_parts:
+            benefit_line = eligibility_parts[0]
+        elif steps:
+            benefit_line = steps.split(".")[0].strip()
+        if not benefit_line:
+            benefit_line = "It provides benefits to eligible applicants"
+        return f"{line_1}.\nBenefit: {benefit_line}."
     if intent == "eligibility":
         if eligibility:
             bullets = [segment.strip().rstrip(".") for segment in eligibility.replace("\n", ". ").split(". ") if segment.strip()]

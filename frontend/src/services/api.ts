@@ -15,6 +15,14 @@ const API_BASE_URL = env.DEV ? API_BASE : ENV_BACKEND_URL;
 const SESSION_KEY = "voice_os_session_id";
 const DEMO_MODE = false;
 
+export function resolveApiUrl(path: string): string {
+  const normalizedPath = path.startsWith("/") ? path : `/${path}`;
+  if (!API_BASE_URL) {
+    return normalizedPath;
+  }
+  return `${API_BASE_URL}${normalizedPath}`;
+}
+
 export interface QuickAction {
   label: string;
   value: string;
@@ -234,7 +242,7 @@ function mapIntentToBackendResponse(payload: IntentApiResponse, transcriptText: 
   const summary = String(payload?.data?.summary || "").trim();
   const nextStep = String(payload?.data?.next_step || "").trim();
   const textBlocks = [rawMessage, summary, nextStep].filter((item) => item.length > 0);
-  const responseText = textBlocks.join("\n\n") || "Can you please clarify your request?";
+  const responseText = textBlocks.join("\n\n") || "Only 15 hardcoded schemes are supported.";
   const detectedScheme = String(payload?.data?.scheme || "").trim();
 
   return {
@@ -435,7 +443,7 @@ export class VoiceWebSocket {
 
   public sendAudio(audioBase64: string, language: string, audioFormat: string = "audio/webm") {
     if (DEMO_MODE) {
-      const fallback = language === "hi" ? "Aapki awaaz mil gayi." : "Audio received.";
+      const fallback = language === "hi" ? "Aapki awaaz transcribe ho gayi." : "Your voice was transcribed.";
       this.emitDemoResponse(fallback, language);
       return;
     }
