@@ -36,7 +36,7 @@ jobs:
           python -m pip install pytest ruff
 
       - name: Lint
-        run: ruff check backend/services/intent_service.py backend/api/v1/routes/voice_routes.py tests tools scripts
+        run: ruff check backend
 
       - name: Run full pytest suite
         run: pytest -q
