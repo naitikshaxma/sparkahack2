@@ -69,6 +69,9 @@ const ROLE_ACTIVE_CONVERSATION_KEY = "voice_os_active_conversation_id";
 const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL || "";
 const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY || "";
 const CONVERSATION_SYNC_DEBOUNCE_MS = 800;
+const INITIAL_RECORDING_SILENCE_MS = 1200;
+const INTERIM_RESULT_SILENCE_MS = 450;
+const SPEECH_END_SILENCE_MS = 250;
 const LEGACY_PLACEHOLDERS = ["aapki awaaz mil gayi", "your voice was transcribed"];
 
 type UiCopy = {
@@ -1096,13 +1099,34 @@ const VoiceInteraction = ({ language, onBack }: VoiceInteractionProps) => {
   const speakText = useCallback(
     async (text: string) => {
       try {
+        // Fast path for greeting/restart: browser TTS starts immediately without backend round-trip.
+        if ("speechSynthesis" in window) {
+          stopListening();
+          stopAudio();
+          setVoiceState("speaking");
+          await new Promise<void>((resolve) => {
+            try {
+              window.speechSynthesis.cancel();
+              const utterance = new SpeechSynthesisUtterance(text);
+              utterance.lang = voiceLanguage === "hi" ? "hi-IN" : "en-US";
+              utterance.onend = () => resolve();
+              utterance.onerror = () => resolve();
+              window.speechSynthesis.speak(utterance);
+            } catch {
+              resolve();
+            }
+          });
+          setVoiceState("idle");
+          return;
+        }
+
         const tts = await synthesizeTts(text, voiceLanguage);
         await playAudioFromBase64(tts.audio_base64);
       } catch {
         setVoiceState("idle");
       }
     },
-    [playAudioFromBase64, setVoiceState, voiceLanguage],
+    [playAudioFromBase64, setVoiceState, stopAudio, stopListening, voiceLanguage],
   );
 
   const playTts = useCallback(
@@ -1255,7 +1279,7 @@ const VoiceInteraction = ({ language, onBack }: VoiceInteractionProps) => {
         setResponseText(mergedResponse);
         updateConversationAssistantText(turnId, mergedResponse);
         markFirstResponse();
-        await playTts(mergedResponse);
+        void playTts(mergedResponse);
       } catch {
         const errorMessage = "❌ केवल इन योजनाओं के बारे में पूछें (15 schemes only supported)";
         setBackendResponse({
@@ -1273,7 +1297,7 @@ const VoiceInteraction = ({ language, onBack }: VoiceInteractionProps) => {
         setResponseText(errorMessage);
         updateConversationAssistantText(turnId, errorMessage);
         markFirstResponse();
-        await playTts(errorMessage);
+        void playTts(errorMessage);
       }
     },
     [markFirstResponse, playTts, setBackendResponse, setResponseText, setSimpleError, updateConversationAssistantText, voiceLanguage],
@@ -1547,7 +1571,7 @@ const VoiceInteraction = ({ language, onBack }: VoiceInteractionProps) => {
               // no-op
             }
           }
-        }, 2500);
+        }, INITIAL_RECORDING_SILENCE_MS);
 
         recognition.onresult = (event) => {
           let transcript = "";
@@ -1565,7 +1589,7 @@ const VoiceInteraction = ({ language, onBack }: VoiceInteractionProps) => {
           }
           silenceTimerRef.current = window.setTimeout(() => {
             stopRecordingAndSend(turnId);
-          }, 1400);
+          }, INTERIM_RESULT_SILENCE_MS);
         };
 
         recognition.onspeechend = () => {
@@ -1574,7 +1598,7 @@ const VoiceInteraction = ({ language, onBack }: VoiceInteractionProps) => {
           }
           silenceTimerRef.current = window.setTimeout(() => {
             stopRecordingAndSend(turnId);
-          }, 700);
+          }, SPEECH_END_SILENCE_MS);
         };
 
         recognition.onend = () => {

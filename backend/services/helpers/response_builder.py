@@ -5,12 +5,9 @@ from backend.response_formatter import format_short_voice_text
 from backend.shared.language.language import normalize_language_code
 from backend.shared.security.privacy import sanitize_profile_for_response
 try:
-    from backend.data.scheme_data import SCHEME_DATA
+    from backend.src.data.schemes_loader import SCHEME_DATA
 except Exception:
-    try:
-        from src.utils.scheme_data import SCHEME_DATA
-    except Exception:
-        from backend.src.utils.scheme_data import SCHEME_DATA
+    from backend.data.scheme_data import SCHEME_DATA
 
 
 CONTROLLED_SCHEME_CLARIFICATION = (
